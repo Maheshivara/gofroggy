@@ -25,23 +25,12 @@ On top of that it offers:
 - A drawer for primitives (circle, line, rectangle and polygon)
 - Basic scene control (update, draw and flow control)
 - Render scaling: draw small, let the driver stretch the frame to the panel (fractional downscale), plus optional vSync
-- Two display backends: one that needs no cgo (a helper process) and one that loads the driver in-process (cgo)
+- Two display backends: one that needs no cgo (with a helper process) and one that loads the driver in-process (cgo)
 - PNG screenshots
-
-## How it works
-
-```
-your app ──► display ──► driver_bridge ──► driver_sf3000.so ──► screen     (bridge backend, no cgo)
-                    └──► driver_sf3000.so (in-process, cgo) ──► screen     (direct backend)
-
-your app ──► input ──► /proc/<cubevol>/mem (shared memory with TreeFrogUI)
-```
-
-You draw into a frame buffer in memory (RGB565) and call `Update()` to show it. The frame buffer can be smaller than the panel; the driver stretches it to full screen.
 
 ## Requirements
 
-- Go 1.21 or newer.
+- Go 1.27 or newer.
 - An SF3000 running TreeFrogUI. The `cubevol` process must be running while your program runs, because input is read from it.
 - `driver_sf3000.so` on the device. It is looked up in the working directory, then in `/mnt/sdcard/cubegm` (or set `Config.DriverPath`).
 - For the bridge backend, the `driver_bridge` executable (same lookup folders).
