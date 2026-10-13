@@ -144,7 +144,7 @@ Measured on one SF3000 with continuous presentation (FPS example), no vSync and 
 | 570x320 to 640x480                          | 39 to 48 fps, tearing |
 | 854x480 (native)                            | about 34 fps, tearing |
 
-> ![INFORMATION]
+> ![TIP]
 > The tearing at high sizes go away with vSync and update_screen (performance wise vSync is better), but expect a drop to ~20 fps.
 
 Tips:
