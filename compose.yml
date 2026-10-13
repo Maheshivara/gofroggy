@@ -1,0 +1,47 @@
+services:
+  bridge-builder:
+    build:
+      dockerfile: docker/Dockerfile
+      context: .
+    env_file:
+      - .env
+    volumes:
+      - ./out:/gofroggy/out
+    working_dir: "/gofroggy/bridge"
+    user: "${MY_UID}:${MY_GID}"
+    command: ["/opt/mipsel-buildroot-linux-gnu_sdk-buildroot/bin/mips-mti-linux-gnu-gcc", "-O2", "-o", "/gofroggy/out/driver_bridge", "driver_bridge.c", -ldl]
+
+  pure-go-builder:
+    build:
+      dockerfile: docker/Dockerfile
+      context: .
+    env_file:
+      - .env
+    environment:
+      - CGO=0
+      - GOOS=linux
+      - GOARCH=mipsle
+      - GOMIPS=softfloat
+    volumes:
+      - ./out:/gofroggy/out
+    user: "${MY_UID}:${MY_GID}"
+    command: [ "go", "build", "-C", "/gofroggy/examples/primitives", "-o", /gofroggy/out/primitives_bridge]
+
+  cgo-builder:
+    build:
+      dockerfile: docker/Dockerfile
+      context: .
+    env_file:
+      - .env
+    environment:
+      - CGO=1
+      - GOOS=linux
+      - GOARCH=mipsle
+      - GOMIPS=softfloat
+      - CC=/usr/local/bin/mips-gcc
+      - CGO_CFLAGS="-O2"
+      - CGO_LDFLAGS=""
+    volumes:
+      - ./out:/gofroggy/out
+    user: "${MY_UID}:${MY_GID}"
+    command: [ "go", "build", "-C", "/gofroggy/examples/primitives", "-o", /gofroggy/out/primitives_direct]

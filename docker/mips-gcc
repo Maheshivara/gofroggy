@@ -1,0 +1,14 @@
+#!/bin/sh
+GCC=/opt/mipsel-buildroot-linux-gnu_sdk-buildroot/bin/mips-mti-linux-gnu-gcc
+
+# Drop the architecture/float flags Go injects, for some reason they conflict with the multilib selection
+n=$#; i=0
+while [ $i -lt $n ]; do
+  a=$1; shift; i=$((i+1))
+  case "$a" in
+    -march=*|-mabi=*|-mhard-float|-msoft-float|-mfp32|-mfp64|-mfpxx|-modd-spreg|-mno-odd-spreg|-mips32*) ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+
+exec "$GCC" -march=mips32r2 "$@"
