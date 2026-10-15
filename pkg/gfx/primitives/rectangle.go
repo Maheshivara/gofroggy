@@ -41,58 +41,29 @@ func (d *PrimitivesDrawer) DrawRectangle(rect Rectangle, config DrawConfig) {
 
 // drawRectangle draws in render pixels.
 func (d *PrimitivesDrawer) drawRectangle(rect Rectangle, config DrawConfig) {
-	if rect.Width <= 0 || rect.Height <= 0 {
+	x, y := rect.Origin.X, rect.Origin.Y
+	w, h := rect.Width, rect.Height
+	if w <= 0 || h <= 0 {
 		return
 	}
 
-	x := rect.Origin.X
-	y := rect.Origin.Y
-	w := rect.Width
-	h := rect.Height
+	// Clamped so a wide border never draws outside the rectangle.
+	bw := min(max(config.BorderWidth, 0), (min(w, h)+1)/2)
 
 	if config.IsFilled {
-		inset := 0
-		if config.BorderWidth > 0 {
-			inset = config.BorderWidth
-		}
-
-		fillX := x + inset
-		fillY := y + inset
-		fillW := w - (2 * inset)
-		fillH := h - (2 * inset)
-
-		for fy := fillY; fy < fillY+fillH; fy++ {
-			for fx := fillX; fx < fillX+fillW; fx++ {
-				d.dc.SetPixel(fx, fy, config.FillColor)
-			}
+		for fy := y + bw; fy < y+h-bw; fy++ {
+			d.span(x+bw, x+w-1-bw, fy, config.FillColor)
 		}
 	}
 
-	if config.BorderWidth > 0 {
-		bw := config.BorderWidth
-
+	if bw > 0 {
 		for row := 0; row < bw; row++ {
-			for col := 0; col < w; col++ {
-				d.dc.SetPixel(x+col, y+row, config.Color)
-			}
+			d.span(x, x+w-1, y+row, config.Color)
+			d.span(x, x+w-1, y+h-1-row, config.Color)
 		}
-
-		for row := 0; row < bw; row++ {
-			for col := 0; col < w; col++ {
-				d.dc.SetPixel(x+col, y+h-1-row, config.Color)
-			}
-		}
-
 		for row := bw; row < h-bw; row++ {
-			for col := 0; col < bw; col++ {
-				d.dc.SetPixel(x+col, y+row, config.Color)
-			}
-		}
-
-		for row := bw; row < h-bw; row++ {
-			for col := 0; col < bw; col++ {
-				d.dc.SetPixel(x+w-1-col, y+row, config.Color)
-			}
+			d.span(x, x+bw-1, y+row, config.Color)
+			d.span(x+w-bw, x+w-1, y+row, config.Color)
 		}
 	}
 }

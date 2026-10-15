@@ -31,13 +31,13 @@ var ColorPresets = []ColorPreset{
 	{"Black", 0x0000},
 }
 
-var ShapeTypes = []string{"Rectangle", "Circle", "Triangle", "Star", "Line"}
+var ShapeTypes = []string{"Rectangle", "RoundedRec", "Circle", "Ellipse", "Triangle", "Star", "Line"}
 
 var BorderWidths = []int{1, 2, 3, 4, 6, 8, 10}
 
 var displayConfig = display.Config{
 	Backend:      display.BackendAuto,
-	Downscale:    1.9,
+	Downscale:    1,
 	VSync:        false,
 	UpdateScreen: false,
 }
@@ -292,6 +292,27 @@ func (app *Application) Draw() {
 			primitives.Point{X: canvasCenter.X + 70, Y: canvasCenter.Y + 35},
 			drawCfg.Color,
 			drawCfg.BorderWidth,
+		)
+	case "RoundedRec":
+		rectW, rectH := 120, 80
+		app.Drawer.Primitives.DrawRoundedRect(
+			primitives.RoundedRect{
+				Origin: primitives.Point{X: canvasCenter.X - (rectW / 2), Y: canvasCenter.Y - (rectH / 2)},
+				Width:  rectW,
+				Height: rectH,
+				Radius: 20,
+			},
+			drawCfg,
+		)
+
+	case "Ellipse":
+		app.Drawer.Primitives.DrawEllipse(
+			primitives.Ellipse{
+				Center:  canvasCenter,
+				RadiusX: 65,
+				RadiusY: 40,
+			},
+			drawCfg,
 		)
 	}
 

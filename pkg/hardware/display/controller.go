@@ -5,12 +5,7 @@ package display
 import (
 	"errors"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
 	"math"
-	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +45,9 @@ type DisplayController interface {
 	// GetPixel returns a pixel in render pixels; out of range gives black.
 	GetPixel(x, y int) uint16
 
+	// HLine fills the pixels x0..x1 (inclusive) of row y, clipped to the frame
+	HLine(x0, x1, y int, color uint16)
+
 	// SaveScreenshot writes the frame buffer to outputDir as the next NNNN.png.
 	SaveScreenshot(outputDir string) error
 
@@ -66,7 +64,7 @@ type DisplayController interface {
 
 // Stats holds the active configuration and the latest timings.
 type Stats struct {
-	// Backend is "direct" or "bridge".
+	// Backend is "direct", "bridge" or "fb".
 	Backend string
 
 	// Downscale is panel width divided by render width.
@@ -83,13 +81,17 @@ type Stats struct {
 
 	// Show is the driver call time of the previous frame.
 	Show time.Duration
+
+	// Skipped counts the frames not shown because they were identical to the
+	// previous one (see Config.DisableFrameCheck).
+	Skipped uint64
 }
 
 // Backend selects the implementation behind NewDisplayController.
 type Backend int
 
 const (
-	// BackendAuto picks Direct in cgo builds and Bridge otherwise.
+	// BackendAuto picks Direct in cgo builds and FB otherwise.
 	BackendAuto Backend = iota
 
 	// BackendBridge uses the driver_bridge helper process (no cgo).
@@ -97,21 +99,26 @@ const (
 
 	// BackendDirect loads the driver in-process (needs cgo).
 	BackendDirect
+
+	// BackendFB writes straight to /dev/fb0 and bypasses the vendor driver.
+	BackendFB
 )
 
-// String returns "auto", "bridge" or "direct".
+// String returns "auto", "bridge", "direct" or "fb".
 func (b Backend) String() string {
 	switch b {
 	case BackendBridge:
 		return "bridge"
 	case BackendDirect:
 		return "direct"
+	case BackendFB:
+		return "fb"
 	default:
 		return "auto"
 	}
 }
 
-// ParseBackend parses "auto", "bridge" or "direct" ("cgo" also means direct).
+// ParseBackend parses "auto", "bridge", "direct" ("cgo" also means direct) or "fb".
 func ParseBackend(s string) (Backend, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto":
@@ -120,8 +127,10 @@ func ParseBackend(s string) (Backend, error) {
 		return BackendBridge, nil
 	case "direct", "cgo":
 		return BackendDirect, nil
+	case "fb":
+		return BackendFB, nil
 	}
-	return BackendAuto, fmt.Errorf("unknown display backend %q (want auto, bridge or direct)", s)
+	return BackendAuto, fmt.Errorf("unknown display backend %q (want auto, bridge, direct or fb)", s)
 }
 
 // Config controls how the display is driven. The zero value is valid.
@@ -152,47 +161,118 @@ type Config struct {
 
 	// Backend picks the implementation (default BackendAuto).
 	Backend Backend
+
+	// DisableFrameCheck turns off the comparison with the previous frame.
+	// By default a frame identical to the last one is not shown again, and
+	// only what changed is copied.
+	DisableFrameCheck bool
+
+	// Rotation forces the render to be rotated clockwise by this angle on its
+	// way to the screen, instead of the rotation the device reports. Only
+	// the fb backend uses it; the others leave rotation to the vendor
+	// driver. RotationNone (the default) keeps the device's own rotation.
+	Rotation Rotation
+}
+
+// Rotation is a clockwise rotation of the render.
+type Rotation int
+
+const (
+	// RotationNone keeps the rotation the device reports.
+	RotationNone Rotation = iota
+
+	// RotationC90 rotates 90 degrees clockwise.
+	RotationC90
+
+	// RotationC180 rotates 180 degrees.
+	RotationC180
+
+	// RotationC270 rotates 270 degrees clockwise.
+	RotationC270
+)
+
+// String returns "none", "c90", "c180" or "c270".
+func (r Rotation) String() string {
+	switch r {
+	case RotationC90:
+		return "c90"
+	case RotationC180:
+		return "c180"
+	case RotationC270:
+		return "c270"
+	default:
+		return "none"
+	}
+}
+
+// Degrees returns the clockwise angle: 0, 90, 180 or 270.
+func (r Rotation) Degrees() int {
+	switch r {
+	case RotationC90:
+		return 90
+	case RotationC180:
+		return 180
+	case RotationC270:
+		return 270
+	default:
+		return 0
+	}
+}
+
+// ParseRotation parses "none", "c90", "c180" or "c270" (also "90", "180", "270").
+func ParseRotation(s string) (Rotation, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "none":
+		return RotationNone, nil
+	case "c90", "90":
+		return RotationC90, nil
+	case "c180", "180":
+		return RotationC180, nil
+	case "c270", "270":
+		return RotationC270, nil
+	}
+	return RotationNone, fmt.Errorf("unknown rotation %q (want none, c90, c180 or c270)", s)
 }
 
 // ErrCGODisabled means BackendDirect was requested in a build without cgo.
 var ErrCGODisabled = errors.New("the direct display backend needs cgo (build with CGO_ENABLED=1)")
 
-// directCtor is set by direct_cgo.go; nil without cgo.
+// directCtor is set by direct.go; nil without cgo.
 var directCtor func(cfg Config) (DisplayController, error)
 
 // NewDisplayController starts the backend chosen in cfg. Call Close when done.
 func NewDisplayController(cfg Config) (DisplayController, error) {
-	useDirect := false
+	backend := BackendFB
 	switch cfg.Backend {
 	case BackendDirect:
-		useDirect = true
+		backend = BackendDirect
 	case BackendBridge:
-		useDirect = false
+		backend = BackendBridge
 	default:
-		useDirect = directCtor != nil
+		if directCtor != nil {
+			backend = BackendDirect
+		}
 	}
 
-	if useDirect {
+	if backend == BackendDirect {
 		if directCtor == nil {
 			return nil, ErrCGODisabled
 		}
 		return directCtor(cfg)
 	}
-	d, err := NewBridgeDisplayController(cfg)
-	if err != nil {
-		return nil, err
+
+	if backend == BackendBridge {
+		d, err := NewBridgeDisplayController(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return d, nil
 	}
-	return d, nil
+	return NewFBDisplayController(cfg)
 }
 
-// Largest render size the driver accepts.
-const (
-	maxRenderWidth  = 1280
-	maxRenderHeight = 720
-)
-
 // resolveSize returns the even render size for cfg (Width x Height, or the
-// panel size divided by Downscale), checked against the driver's range.
+// panel size divided by Downscale).
 func resolveSize(cfg Config, panelW, panelH int) (w, h int, err error) {
 	if cfg.Width > 0 && cfg.Height > 0 {
 		w, h = cfg.Width, cfg.Height
@@ -206,20 +286,20 @@ func resolveSize(cfg Config, panelW, panelH int) (w, h int, err error) {
 		}
 		fw := math.Floor(float64(panelW) / f)
 		fh := math.Floor(float64(panelH) / f)
-		if !(fw >= 2 && fw <= maxRenderWidth && fh >= 2 && fh <= maxRenderHeight) {
-			return 0, 0, fmt.Errorf("downscale %v gives an unsupported size for a %dx%d panel (driver range 2x2 to %dx%d)",
-				cfg.Downscale, panelW, panelH, maxRenderWidth, maxRenderHeight)
-		}
 		w, h = int(fw), int(fh)
 	}
 
 	// Even dimensions only: odd source widths wedge some driver builds.
 	w &^= 1
 	h &^= 1
-	if w < 2 || h < 2 || w > maxRenderWidth || h > maxRenderHeight {
-		return 0, 0, fmt.Errorf("unsupported render size %dx%d (driver range 2x2 to %dx%d)",
-			w, h, maxRenderWidth, maxRenderHeight)
+
+	if w < 2 || h < 2 {
+		return 0, 0, fmt.Errorf("render size %dx%d is too small", w, h)
 	}
+	if w > 1280 || h > 720 {
+		return 0, 0, fmt.Errorf("render size %dx%d is larger than 1280x720", w, h)
+	}
+
 	return w, h, nil
 }
 
@@ -232,12 +312,7 @@ func readPanelSize() (w, h int) {
 		return w, h
 	}
 
-	defer func() {
-		err := syscall.Close(fd)
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { _ = syscall.Close(fd) }()
 
 	// struct fb_var_screeninfo is 160 bytes; xres and yres are its first two
 	// uint32 fields. FBIOGET_VSCREENINFO = 0x4600.
@@ -248,140 +323,4 @@ func readPanelSize() (w, h int) {
 		w, h = int(vinfo[0]), int(vinfo[1])
 	}
 	return w, h
-}
-
-// frame is the frame buffer and drawing code shared by both backends.
-type frame struct {
-	w, h   int // render size
-	lw, lh int // logical size (the panel size)
-	buf    []uint16
-}
-
-// LogicalSize returns the panel size.
-func (f *frame) LogicalSize() (int, int) {
-	if f.lw <= 0 || f.lh <= 0 {
-		return f.w, f.h
-	}
-	return f.lw, f.lh
-}
-
-// Scale returns render pixels per logical pixel.
-func (f *frame) Scale() (sx, sy float64) {
-	if f.lw <= 0 || f.lh <= 0 {
-		return 1, 1
-	}
-	return float64(f.w) / float64(f.lw), float64(f.h) / float64(f.lh)
-}
-
-// Width returns the render width.
-func (f *frame) Width() int { return f.w }
-
-// Height returns the render height.
-func (f *frame) Height() int { return f.h }
-
-// Buffer returns the frame buffer.
-func (f *frame) Buffer() []uint16 { return f.buf }
-
-// Set buffer directly
-func (f *frame) SetBuffer(b []uint16) { f.buf = b }
-
-// Clear fills the frame buffer with c.
-func (f *frame) Clear(c uint16) {
-	if c == 0 {
-		clear(f.buf)
-		return
-	}
-	if len(f.buf) == 0 {
-		return
-	}
-	row := f.buf[:f.w]
-	for i := range row {
-		row[i] = c
-	}
-	for y := 1; y < f.h; y++ {
-		copy(f.buf[y*f.w:(y+1)*f.w], row)
-	}
-}
-
-// SetPixel sets a pixel in render pixels.
-func (f *frame) SetPixel(x, y int, c uint16) {
-	if x < 0 || x >= f.w || y < 0 || y >= f.h {
-		return
-	}
-	f.buf[y*f.w+x] = c
-}
-
-// GetPixel returns a pixel in render pixels.
-func (f *frame) GetPixel(x, y int) uint16 {
-	if x < 0 || x >= f.w || y < 0 || y >= f.h {
-		return _BLACK_COLOR
-	}
-	return f.buf[y*f.w+x]
-}
-
-// SaveScreenshot writes the frame buffer as a PNG.
-func (f *frame) SaveScreenshot(outputDir string) error {
-	bufCopy := make([]uint16, len(f.buf))
-	copy(bufCopy, f.buf)
-	return saveBufferToFile(bufCopy, f.w, f.h, outputDir)
-}
-
-// SaveScreenshotAsync writes the PNG in the background.
-func (f *frame) SaveScreenshotAsync(outputDir string) {
-	bufCopy := make([]uint16, len(f.buf))
-	copy(bufCopy, f.buf)
-	w, h := f.w, f.h
-
-	go func() {
-		_ = saveBufferToFile(bufCopy, w, h, outputDir)
-	}()
-}
-
-// saveBufferToFile writes buf as the next NNNN.png in outputDir.
-func saveBufferToFile(buf []uint16, width, height int, outputDir string) error {
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	entries, err := os.ReadDir(outputDir)
-	if err != nil {
-		return fmt.Errorf("failed to read output directory: %w", err)
-	}
-
-	pngCount := 0
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".png") {
-			pngCount++
-		}
-	}
-
-	filePath := filepath.Join(outputDir, fmt.Sprintf("%04d.png", pngCount+1))
-
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			p := buf[y*width+x]
-
-			r := uint8(((p >> 11) & 0x1F) * 255 / 31)
-			g := uint8(((p >> 5) & 0x3F) * 255 / 63)
-			b := uint8((p & 0x1F) * 255 / 31)
-
-			img.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
-		}
-	}
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
-	}
-
-	defer func() {
-		err = file.Close()
-	}()
-
-	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
-	if err := encoder.Encode(file, img); err != nil {
-		return fmt.Errorf("failed to encode png: %w", err)
-	}
-	return err
 }

@@ -43,6 +43,13 @@ func (d *PrimitivesDrawer) scale() (sx, sy float64) {
 	return d.dc.Scale()
 }
 
+// span draws the pixels x0..x1 (inclusive) of row y; nothing if x0 > x1.
+func (d *PrimitivesDrawer) span(x0, x1, y int, color uint16) {
+	if x0 <= x1 {
+		d.dc.HLine(x0, x1, y, color)
+	}
+}
+
 // scaleCoord converts a logical coordinate to render pixels.
 func scaleCoord(v int, s float64) int {
 	return int(math.Round(float64(v) * s))
@@ -68,4 +75,16 @@ func scalePoint(p Point, sx, sy float64) Point {
 // avgScale returns the mean of the two axis scales, for lengths and radii.
 func avgScale(sx, sy float64) float64 {
 	return (sx + sy) / 2
+}
+
+// isqrt returns floor(sqrt(n)) for n >= 0.
+func isqrt(n int64) int {
+	r := int64(math.Sqrt(float64(n)))
+	for r*r > n {
+		r--
+	}
+	for (r+1)*(r+1) <= n {
+		r++
+	}
+	return int(r)
 }

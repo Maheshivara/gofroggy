@@ -22,8 +22,8 @@ const (
 )
 
 var displayConfig = display.Config{
-	Backend:      display.BackendBridge,
-	Downscale:    1.9,
+	Backend:      display.BackendAuto,
+	Downscale:    1,
 	VSync:        false,
 	UpdateScreen: false,
 }

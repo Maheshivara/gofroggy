@@ -76,8 +76,8 @@ func (r *TextDrawer) DrawText(f *Font, str string, startX, startY int, color uin
 		mask, bounds, err := f.getCachedGlyph(glyph.GlyphID)
 		if err == nil && mask != nil {
 
-			gx := penX.Floor() + glyph.XOffset.Floor() + bounds.MinX
-			gy := penY.Floor() - glyph.YOffset.Floor() + bounds.MinY
+			gx := (penX + glyph.XOffset).Round() + bounds.MinX
+			gy := (penY - glyph.YOffset).Round() + bounds.MinY
 
 			for y := 0; y < mask.Height; y++ {
 				for x := 0; x < mask.Width; x++ {
@@ -97,7 +97,6 @@ func (r *TextDrawer) DrawText(f *Font, str string, startX, startY int, color uin
 		}
 
 		penX += glyph.Advance
-		penY += glyph.Advance
 	}
 }
 

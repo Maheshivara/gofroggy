@@ -1,6 +1,7 @@
 package text
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"image/draw"
@@ -67,37 +68,95 @@ func parseScriptSafe(str string) language.Script {
 	return scr
 }
 
+// parsedFonts keeps parsed font files, so loading the same file again (for
+// another size) skips the file read and the parse.
+var parsedFonts = struct {
+	sync.Mutex
+	m map[string]*font.Font
+}{m: make(map[string]*font.Font)}
+
+// ClearFontCache drops the parsed font files kept by LoadFont. Fonts already
+// loaded keep working; call it to free memory after switching fonts.
+func ClearFontCache() {
+	parsedFonts.Lock()
+	clear(parsedFonts.m)
+	parsedFonts.Unlock()
+}
+
+// loadParsed returns the parsed font file, reading it only on first use.
+func loadParsed(path string) (*font.Font, error) {
+	parsedFonts.Lock()
+	defer parsedFonts.Unlock()
+
+	if f, ok := parsedFonts.m[path]; ok {
+		return f, nil
+	}
+
+	// One sequential read; the parser then works from memory instead of
+	// seeking around the file on a slow SD card.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	loader, err := opentype.NewLoader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := font.NewFont(loader)
+	if err != nil {
+		return nil, err
+	}
+
+	parsedFonts.m[path] = f
+	return f, nil
+}
+
 // LoadFont loads a TTF or OTF file at the given logical size. If that fails it
-// returns a Font that uses the bitmap font.
+// returns a Font that uses the bitmap font. The parsed file is kept, so loading
+// the same path again at another size is cheap.
 func LoadFont(path string, size float64) (*Font, error) {
-	file, err := os.Open(path)
+	loadedFont, err := loadParsed(path)
 	if err != nil {
 		return &Font{face: nil, size: size, scale: 1}, err
 	}
-	defer func() {
-		err = file.Close()
-	}()
-
-	loader, err := opentype.NewLoader(file)
-	if err != nil {
-		return &Font{face: nil, size: size, scale: 1}, err
-	}
-
-	loadedFont, err := font.NewFont(loader)
-	if err != nil {
-		return &Font{face: nil, size: size, scale: 1}, err
-	}
-
-	face := font.NewFace(loadedFont)
 
 	return &Font{
-		face:       face,
+		face:       font.NewFace(loadedFont),
 		baseFont:   loadedFont,
 		size:       size,
 		scale:      1,
 		shaper:     shaping.HarfbuzzShaper{},
 		glyphCache: make(map[font.GID]CachedGlyph),
-	}, err
+	}, nil
+}
+
+// Warmup string.
+const ASCII = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+// Warmup shapes str and rasterizes its glyphs now, so the first DrawText that
+// uses them doesn't pay for it. Call SetScale first (a scale change clears the
+// glyph cache) and don't call it while another goroutine draws with f.
+func (f *Font) Warmup(str string) {
+	runes := []rune(str)
+	if f == nil || f.face == nil || len(runes) == 0 {
+		return
+	}
+
+	output := f.shaper.Shape(shaping.Input{
+		Text:      runes,
+		RunStart:  0,
+		RunEnd:    len(runes),
+		Direction: di.DirectionLTR,
+		Script:    parseScriptSafe("Latn"),
+		Face:      f.face,
+		Size:      fixedSize(f.renderSize()),
+	})
+
+	for _, glyph := range output.Glyphs {
+		_, _, _ = f.getCachedGlyph(glyph.GlyphID)
+	}
 }
 
 // effScale returns the render scale, treating unset as 1.
@@ -159,6 +218,9 @@ func (f *Font) getCachedGlyph(glyphID font.GID) (*AlphaMask, Bounds, error) {
 }
 
 // rasterizeGlyph renders a glyph at size (render pixels) into an alpha mask.
+// The outline is shifted by the fractional part of its position, so the mask
+// holds the exact shape and Bounds is its whole-pixel offset from the glyph
+// origin (the point on the baseline).
 func rasterizeGlyph(face *font.Face, glyphID font.GID, size float64) (*AlphaMask, Bounds, error) {
 	var b Bounds
 
@@ -167,23 +229,22 @@ func rasterizeGlyph(face *font.Face, glyphID font.GID, size float64) (*AlphaMask
 		return nil, b, nil
 	}
 
-	upem := float64(face.Upem())
-	scale := size / upem
+	scale := size / float64(face.Upem())
 
-	minX := float64(extents.XBearing) * scale
-	maxY := float64(extents.YBearing) * scale
-	widthFloat := float64(extents.Width) * scale
-	heightFloat := float64(-extents.Height) * scale
+	// The glyph's box in pixels from its origin, with y pointing down.
+	left := float64(extents.XBearing) * scale
+	top := -float64(extents.YBearing) * scale
+	right := left + float64(extents.Width)*scale
+	bottom := top - float64(extents.Height)*scale // Height is negative
 
-	width := int(math.Ceil(widthFloat)) + 1
-	height := int(math.Ceil(heightFloat)) + 1
+	b.MinX = int(math.Floor(left))
+	b.MinY = int(math.Floor(top))
+	width := int(math.Ceil(right)) - b.MinX
+	height := int(math.Ceil(bottom)) - b.MinY
 
-	if width <= 1 || height <= 1 {
+	if width <= 0 || height <= 0 {
 		return nil, b, nil
 	}
-
-	b.MinX = int(math.Floor(minX))
-	b.MinY = int(math.Floor(-maxY))
 
 	outline, ok := face.GlyphDataOutline(glyphID)
 	if !ok {
@@ -193,50 +254,39 @@ func rasterizeGlyph(face *font.Face, glyphID font.GID, size float64) (*AlphaMask
 	ras := vector.NewRasterizer(width, height)
 	ras.DrawOp = draw.Over
 
-	xBearing := float32(extents.XBearing)
-	yBearing := float32(extents.YBearing)
 	s := float32(scale)
+	ox, oy := float32(b.MinX), float32(b.MinY)
+	tx := func(x float32) float32 { return x*s - ox }
+	ty := func(y float32) float32 { return -y*s - oy }
 
 	for _, segment := range outline.Segments {
 		switch segment.Op {
 		case opentype.SegmentOpMoveTo:
-			x := (float32(segment.Args[0].X) - xBearing) * s
-			y := (yBearing - float32(segment.Args[0].Y)) * s
-			ras.MoveTo(x, y)
+			ras.MoveTo(tx(float32(segment.Args[0].X)), ty(float32(segment.Args[0].Y)))
 
 		case opentype.SegmentOpLineTo:
-			x := (float32(segment.Args[0].X) - xBearing) * s
-			y := (yBearing - float32(segment.Args[0].Y)) * s
-			ras.LineTo(x, y)
+			ras.LineTo(tx(float32(segment.Args[0].X)), ty(float32(segment.Args[0].Y)))
 
 		case opentype.SegmentOpQuadTo:
-			cx := (float32(segment.Args[0].X) - xBearing) * s
-			cy := (yBearing - float32(segment.Args[0].Y)) * s
-			x := (float32(segment.Args[1].X) - xBearing) * s
-			y := (yBearing - float32(segment.Args[1].Y)) * s
-			ras.QuadTo(cx, cy, x, y)
+			ras.QuadTo(
+				tx(float32(segment.Args[0].X)), ty(float32(segment.Args[0].Y)),
+				tx(float32(segment.Args[1].X)), ty(float32(segment.Args[1].Y)))
 
 		case opentype.SegmentOpCubeTo:
-			c1x := (float32(segment.Args[0].X) - xBearing) * s
-			c1y := (yBearing - float32(segment.Args[0].Y)) * s
-			c2x := (float32(segment.Args[1].X) - xBearing) * s
-			c2y := (yBearing - float32(segment.Args[1].Y)) * s
-			x := (float32(segment.Args[2].X) - xBearing) * s
-			y := (yBearing - float32(segment.Args[2].Y)) * s
-			ras.CubeTo(c1x, c1y, c2x, c2y, x, y)
+			ras.CubeTo(
+				tx(float32(segment.Args[0].X)), ty(float32(segment.Args[0].Y)),
+				tx(float32(segment.Args[1].X)), ty(float32(segment.Args[1].Y)),
+				tx(float32(segment.Args[2].X)), ty(float32(segment.Args[2].Y)))
 		}
 	}
 
-	pixels := make([]byte, width*height)
 	dst := image.NewAlpha(image.Rect(0, 0, width, height))
 	ras.Draw(dst, image.Rect(0, 0, width, height), image.NewUniform(color.Alpha{A: 255}), image.Point{})
-
-	copy(pixels, dst.Pix)
 
 	return &AlphaMask{
 		Width:  width,
 		Height: height,
-		Pixels: pixels,
+		Pixels: dst.Pix,
 	}, b, nil
 }
 
