@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -151,13 +150,6 @@ func (app *Application) Draw() {
 
 	ascent, _ := app.Font.GetMetrics()
 
-	app.Drawer.Primitives.DrawLine(
-		primitives.Point{X: screenWidth / 2, Y: 40},
-		primitives.Point{X: screenWidth / 2, Y: screenHeight - 40},
-		ColorRed,
-		1,
-	)
-
 	fpsStr := fmt.Sprintf("FPS: %.1f", app.FPS)
 	fpsColor := ColorGreen
 	if app.FPS < 30 {
@@ -200,15 +192,9 @@ func (app *Application) Run() {
 
 func main() {
 
-	flag.Parse()
+	cfg := display.Config{Width: 0, Height: 0, Downscale: 1, VSync: false, UpdateScreen: false, Backend: display.BackendAuto}
 
-	backend, err := display.ParseBackend("bridge")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(2)
-	}
-	cfg := display.Config{Width: 0, Height: 0, Downscale: 2, VSync: false, UpdateScreen: false, Backend: backend}
-
+	var err error
 	logFile, err = os.OpenFile("/mnt/sdcard/test.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		fmt.Printf("Failed to open log file: %v\n", err)

@@ -24,6 +24,13 @@ type BridgeDisplayController struct {
 
 	lastCopy, lastWait, lastShow time.Duration
 
+	check   bool   // compare frames, skipping or shrinking unchanged ones
+	skipped uint64 // frames skipped because they were identical
+	rowsOK  bool   // the bridge can copy just some rows ("R" command)
+	cur     int    // staging buffer the bridge fills next (it alternates)
+	pend    [2]damage
+	rowsCmd [5]byte
+
 	cmd       *exec.Cmd
 	stdinPipe io.WriteCloser
 	reader    *bufio.Reader
@@ -33,8 +40,11 @@ type BridgeDisplayController struct {
 
 var _ DisplayController = (*BridgeDisplayController)(nil)
 
-// bridgeFrameCmd tells the bridge that a frame is ready.
+// bridgeFrameCmd tells the bridge that a whole frame is ready.
 var bridgeFrameCmd = []byte{'F'}
+
+// A bridge that can copy only part of a frame also accepts 'R', then the
+// first and last changed row as little-endian uint16: five bytes in all.
 
 // NewBridgeDisplayController starts driver_bridge and maps its frame buffer.
 func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
@@ -90,7 +100,8 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 		_ = cmd.Wait()
 	}
 
-	// Handshake: "OK <w> <h> <shm path> <vsync>" or "ERR <message>".
+	// Handshake: "OK <w> <h> <shm path> <vsync> [R]" or "ERR <message>". The
+	// optional R says the bridge understands the row-range command.
 	reader := bufio.NewReader(stdout)
 	type reply struct {
 		line string
@@ -133,6 +144,7 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	}
 	shmPath := parts[3]
 	vsyncOK := parts[4] == "1"
+	rowsOK := len(parts) >= 6 && parts[5] == "R"
 
 	totalPixels := width * height
 	frameSize := totalPixels * 2
@@ -165,6 +177,9 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	d := &BridgeDisplayController{
 		downscale:   float64(panelW) / float64(width),
 		vsyncActive: vsyncOK,
+		check:       !cfg.DisableFrameCheck,
+		rowsOK:      rowsOK,
+		pend:        [2]damage{noDamage, noDamage},
 		cmd:         cmd,
 		stdinPipe:   stdin,
 		reader:      reader,
@@ -178,13 +193,39 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 }
 
 // Update sends the frame to the bridge and returns once it is copied to the
-// driver. The bridge presents it while you draw the next frame.
+// driver. The bridge presents it while you draw the next frame. A frame
+// identical to the last one is skipped.
 func (d *BridgeDisplayController) Update() error {
 	if d.stdinPipe == nil || len(d.buf) == 0 {
 		return nil
 	}
 
-	if _, err := d.stdinPipe.Write(bridgeFrameCmd); err != nil {
+	t := time.Now()
+	dm := d.fullDamage()
+	if d.check {
+		if dm = d.diff(); dm.empty() {
+			d.lastCopy = time.Since(t)
+			d.skipped++
+			return nil
+		}
+	}
+	diffTime := time.Since(t)
+
+	cmd := bridgeFrameCmd
+	if d.rowsOK {
+		// The bridge alternates two staging buffers, so the one it fills next
+		// is a frame behind and needs the changes of both frames.
+		d.pend[0] = d.pend[0].union(dm)
+		d.pend[1] = d.pend[1].union(dm)
+		rows := d.pend[d.cur]
+		d.pend[d.cur] = noDamage
+		d.cur ^= 1
+
+		d.rowsCmd = [5]byte{'R', byte(rows.r0), byte(rows.r0 >> 8), byte(rows.r1), byte(rows.r1 >> 8)}
+		cmd = d.rowsCmd[:]
+	}
+
+	if _, err := d.stdinPipe.Write(cmd); err != nil {
 		return err
 	}
 	if _, err := io.ReadFull(d.reader, d.ack[:]); err != nil {
@@ -194,7 +235,7 @@ func (d *BridgeDisplayController) Update() error {
 	us := func(b []byte) time.Duration {
 		return time.Duration(binary.NativeEndian.Uint32(b)) * time.Microsecond
 	}
-	d.lastCopy = us(d.ack[0:4])
+	d.lastCopy = diffTime + us(d.ack[0:4])
 	d.lastWait = us(d.ack[4:8])
 	d.lastShow = us(d.ack[8:12])
 	return nil
@@ -209,6 +250,7 @@ func (d *BridgeDisplayController) Stats() Stats {
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,
 		Show:        d.lastShow,
+		Skipped:     d.skipped,
 	}
 }
 
@@ -219,7 +261,19 @@ func (d *BridgeDisplayController) Close() {
 		d.stdinPipe = nil
 	}
 	if d.cmd != nil {
-		_ = d.cmd.Wait()
+		// Don't hang if the bridge is stuck inside a driver call.
+		cmd := d.cmd
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
 		d.cmd = nil
 	}
 	if d.shm != nil {

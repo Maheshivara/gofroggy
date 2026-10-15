@@ -39,6 +39,10 @@ type DirectDisplayController struct {
 
 	stage [2]unsafe.Pointer // C-allocated staging buffers
 	next  int               // staging buffer for the next frame
+	pend  [2]damage         // changes each staging buffer has not received yet
+
+	check   bool   // compare frames, skipping or shrinking unchanged ones
+	skipped uint64 // frames skipped because they were identical
 
 	pending bool
 	req     chan int          // staging buffer index to present; closed to stop
@@ -80,6 +84,8 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 		vsyncActive:  vsyncOK,
 		updateScreen: cfg.UpdateScreen,
 		frameSize:    frameSize,
+		pend:         [2]damage{noDamage, noDamage},
+		check:        !cfg.DisableFrameCheck,
 		req:          make(chan int, 1),
 		done:         make(chan directTiming, 1),
 		quit:         make(chan struct{}),
@@ -157,12 +163,25 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 	return d, nil
 }
 
-// Update copies the frame to the idle staging buffer and presents it in the
-// background. It blocks only while the previous frame is still presenting.
+// Update copies what changed into the idle staging buffer and presents it in
+// the background. A frame identical to the last one is skipped. It blocks only
+// while the previous frame is still presenting.
 func (d *DirectDisplayController) Update() error {
 	if d.req == nil || len(d.buf) == 0 {
 		return nil
 	}
+
+	// Compare first: the driver thread may still be presenting the last frame.
+	t := time.Now()
+	dm := d.fullDamage()
+	if d.check {
+		if dm = d.diff(); dm.empty() {
+			d.lastCopy = time.Since(t)
+			d.skipped++
+			return nil
+		}
+	}
+	diffTime := time.Since(t)
 
 	if d.pending {
 		tm := <-d.done
@@ -173,9 +192,19 @@ func (d *DirectDisplayController) Update() error {
 	i := d.next
 	d.next ^= 1
 
-	t := time.Now()
-	C.dd_copy(d.stage[i], unsafe.Pointer(&d.buf[0]), C.size_t(d.frameSize))
-	d.lastCopy = time.Since(t)
+	// The buffer about to be filled is a frame behind, so it also needs what
+	// changed since it was last filled: copy whole rows covering both.
+	d.pend[0] = d.pend[0].union(dm)
+	d.pend[1] = d.pend[1].union(dm)
+	rows := d.pend[i]
+	d.pend[i] = noDamage
+
+	t = time.Now()
+	rowBytes := d.w * 2
+	C.dd_copy(unsafe.Add(d.stage[i], rows.r0*rowBytes),
+		unsafe.Pointer(&d.buf[rows.r0*d.w]),
+		C.size_t((rows.r1-rows.r0+1)*rowBytes))
+	d.lastCopy = diffTime + time.Since(t)
 
 	d.req <- i
 	d.pending = true
@@ -191,6 +220,7 @@ func (d *DirectDisplayController) Stats() Stats {
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,
 		Show:        d.lastShow,
+		Skipped:     d.skipped,
 	}
 }
 

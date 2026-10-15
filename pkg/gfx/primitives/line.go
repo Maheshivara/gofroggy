@@ -24,6 +24,25 @@ func (d *PrimitivesDrawer) drawLine(p1, p2 Point, color uint16, thickness int) {
 	x0, y0 := p1.X, p1.Y
 	x1, y1 := p2.X, p2.Y
 
+	// Offset of the first pixel of a thickness-wide dot from its center.
+	off := -(thickness - 1) / 2
+
+	// Horizontal and vertical lines need no stepping, just spans.
+	if y0 == y1 {
+		xa, xb := min(x0, x1), max(x0, x1)
+		for row := y0 + off; row < y0+off+thickness; row++ {
+			d.span(xa+off, xb+off+thickness-1, row, color)
+		}
+		return
+	}
+	if x0 == x1 {
+		ya, yb := min(y0, y1), max(y0, y1)
+		for row := ya + off; row < yb+off+thickness; row++ {
+			d.span(x0+off, x0+off+thickness-1, row, color)
+		}
+		return
+	}
+
 	dx := abs(x1 - x0)
 	dy := abs(y1 - y0)
 
@@ -58,18 +77,12 @@ func (d *PrimitivesDrawer) drawLine(p1, p2 Point, color uint16, thickness int) {
 	}
 }
 
-// drawPointThickness draws a square dot centered on (cx, cy).
+// drawPointThickness draws a square dot of exactly thickness pixels around
+// (cx, cy); even sizes lean up and to the left.
 func (d *PrimitivesDrawer) drawPointThickness(cx, cy, thickness int, color uint16) {
-	if thickness == 1 {
-		d.dc.SetPixel(cx, cy, color)
-		return
-	}
-
-	radius := thickness / 2
-	for y := cy - radius; y <= cy+radius; y++ {
-		for x := cx - radius; x <= cx+radius; x++ {
-			d.dc.SetPixel(x, y, color)
-		}
+	off := -(thickness - 1) / 2
+	for y := cy + off; y < cy+off+thickness; y++ {
+		d.span(cx+off, cx+off+thickness-1, y, color)
 	}
 }
 

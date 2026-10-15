@@ -1,6 +1,6 @@
 package primitives
 
-import "sort"
+import "slices"
 
 // Polygon is a closed shape made of points in logical pixels.
 type Polygon struct {
@@ -46,7 +46,7 @@ func (d *PrimitivesDrawer) drawPolygon(poly Polygon, config DrawConfig) {
 	}
 }
 
-// fillPolygon fills the polygon with color, one line at a time.
+// fillPolygon fills the polygon with color, one scanline at a time.
 func (d *PrimitivesDrawer) fillPolygon(points []Point, color uint16) {
 	n := len(points)
 	if n < 3 {
@@ -56,16 +56,14 @@ func (d *PrimitivesDrawer) fillPolygon(points []Point, color uint16) {
 	minY := points[0].Y
 	maxY := points[0].Y
 	for _, p := range points {
-		if p.Y < minY {
-			minY = p.Y
-		}
-		if p.Y > maxY {
-			maxY = p.Y
-		}
+		minY = min(minY, p.Y)
+		maxY = max(maxY, p.Y)
 	}
 
+	nodes := make([]int, 0, n) // reused for every scanline
+
 	for y := minY; y <= maxY; y++ {
-		var nodes []int
+		nodes = nodes[:0]
 
 		for i := 0; i < n; i++ {
 			p1 := points[i]
@@ -77,15 +75,10 @@ func (d *PrimitivesDrawer) fillPolygon(points []Point, color uint16) {
 			}
 		}
 
-		sort.Ints(nodes)
+		slices.Sort(nodes)
 
-		for i := 0; i < len(nodes)-1; i += 2 {
-			xStart := nodes[i]
-			xEnd := nodes[i+1]
-
-			for x := xStart; x <= xEnd; x++ {
-				d.dc.SetPixel(x, y, color)
-			}
+		for i := 0; i+1 < len(nodes); i += 2 {
+			d.span(nodes[i], nodes[i+1], y, color)
 		}
 	}
 }

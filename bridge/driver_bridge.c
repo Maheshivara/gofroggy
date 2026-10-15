@@ -11,11 +11,14 @@
 //   1. The bridge loads the driver, allocates the staging buffers and creates a
 //      shared-memory file holding ONE frame (what Go draws into). It then
 //      prints one line on the protocol channel:
-//          OK <width> <height> <shm path> <vsync 0|1>
-//      or, if anything failed:
+//          OK <width> <height> <shm path> <vsync 0|1> R
+//      (the trailing R means the row-range command below is understood) or,
+//      if anything failed:
 //          ERR <message>
 //   2. Go writes one byte 'F' to the bridge's stdin = "the frame in shared
-//      memory is finished".
+//      memory is finished". Or the five bytes 'R', row0 (uint16 LE), row1
+//      (uint16 LE) = "only rows row0..row1 (inclusive) changed since this
+//      staging buffer was last filled"; only those rows are copied.
 //   3. The bridge copies it into the next staging buffer, then replies with
 //      three uint32 (native endian), in microseconds:
 //          [copy time of this frame][vsync wait of previous frame][show time of
@@ -56,6 +59,21 @@ static uint64_t now_us(void) {
 }
 
 static int proto_fd = -1;
+
+// read_full reads exactly n bytes; returns -1 on EOF or error.
+static int read_full(int fd, void *buf, size_t n) {
+  unsigned char *p = (unsigned char *)buf;
+  while (n > 0) {
+    ssize_t r = read(fd, p, n);
+    if (r < 0 && errno == EINTR)
+      continue;
+    if (r <= 0)
+      return -1;
+    p += r;
+    n -= (size_t)r;
+  }
+  return 0;
+}
 
 static int fail(const char *msg) {
   dprintf(proto_fd, "ERR %s\n", msg);
@@ -183,7 +201,7 @@ int main(int argc, char **argv) {
     return fail("cannot mmap shared memory");
 
   // Ready
-  dprintf(proto_fd, "OK %d %d %s %d\n", width, height, shm_path, vsync_ok);
+  dprintf(proto_fd, "OK %d %d %s %d R\n", width, height, shm_path, vsync_ok);
 
   // Frame loop
   uint32_t last_wait_us = 0, last_show_us = 0;
@@ -196,15 +214,28 @@ int main(int argc, char **argv) {
     } while (n < 0 && errno == EINTR);
     if (n != 1)
       break; // EOF: Go closed the pipe or died
-    if (cmd != 'F')
+    if (cmd != 'F' && cmd != 'R')
       continue;
+
+    int row0 = 0, row1 = height - 1;
+    if (cmd == 'R') {
+      unsigned char r[4];
+      if (read_full(STDIN_FILENO, r, sizeof r) != 0)
+        break;
+      row0 = r[0] | (r[1] << 8);
+      row1 = r[2] | (r[3] << 8);
+      if (row1 >= height)
+        row1 = height - 1;
+    }
 
     // Copy the finished frame into the staging buffer the hardware is NOT
     // reading...
     unsigned char *buf = stage[cur];
     cur ^= 1;
     uint64_t t0 = now_us();
-    memcpy(buf, shm, frame_size);
+    if (row1 >= row0)
+      memcpy(buf + (size_t)row0 * pitch, shm + (size_t)row0 * pitch,
+             (size_t)(row1 - row0 + 1) * pitch);
     uint32_t copy_us = (uint32_t)(now_us() - t0);
 
     // ...and tell Go right away so it can draw the next frame while we present.
