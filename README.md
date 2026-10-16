@@ -24,6 +24,7 @@ On top of that it offers:
 - As expected from something that allows font use... it draws text
 - A drawer for primitives (circle, line, rectangle and polygon)
 - Basic scene control (update, draw and flow control)
+- Very basic sprite control.
 - Render scaling: draw small, let the driver stretch the frame to the panel (fractional downscale), plus optional vSync
 - Three display backends: one that needs no cgo (with a helper process), one that loads the driver in-process (cgo) and one that controls the framebuffer directly
 - PNG screenshots
@@ -112,12 +113,13 @@ To use the direct backend instead, build with `CGO_ENABLED=1` and the toolchain'
 
 There are some examples on the [./examples](./examples) dir those are:
 
-| Example    | Screenshot                                     | Description                                                                        |
-| ---------- | ---------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Font       | ![Font example](./docs/images/font.png)        | A bunch of text with various origins and a font loader (from the TreeFrogUI fonts) |
-| FPS        | ![FPS example](./docs/images/fps.png)          | Just a blue bar running on screen with a FPS meter                                 |
-| Input      | ![Input example](./docs/images/input.png)      | Screen where every button pressed is indicated                                     |
-| Primitives | ![Input example](./docs/images/primitives.png) | Small playground with some options to test the framework primitives                |
+| Example    | Screenshot                                          | Description                                                                          |
+| ---------- | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Font       | ![Font example](./docs/images/font.png)             | A bunch of text with various origins and a font loader (from the TreeFrogUI fonts)   |
+| FPS        | ![FPS example](./docs/images/fps.png)               | Just a blue bar running on screen with a FPS meter                                   |
+| Input      | ![Input example](./docs/images/input.png)           | Screen where every button pressed is indicated                                       |
+| Primitives | ![Primitives example](./docs/images/primitives.png) | Small playground with some options to test the framework primitives                  |
+| Sprites    | ![Input example](./docs/images/primitives.png)      | Animating Luiz Melo [Evil Wizard](https://luizmelo.itch.io/evil-wizard) sprite sheet |
 
 ## Display
 
@@ -156,6 +158,7 @@ Tips:
 ## Drawing and text
 
 - **Primitives:** `gfx.NewDrawer(disp)` gives you `drawer.Primitives` (`DrawRectangle`, `DrawRoundedRect` `DrawCircle`, `DrawEllipse` `DrawLine`, `DrawPolygon`) and `drawer.Text`.
+- **Sprites** The drawer also gives you a Sprite loader for easy sheet animation.
 - **Fonts:** `text.LoadFont(path, size)` loads a TTF or OTF file at a logical size. With an empty path, or if loading fails, it falls back to the built-in 8x8 font, which only scales in whole-pixel steps.
 - **Layout:** `MeasureText` and `GetMetrics` return logical pixels. Call `font.SetScale(sy)` after creating the display so they are right from the first frame.
 - **Screenshots:** `disp.SaveScreenshot(dir)` and `SaveScreenshotAsync(dir)` write numbered PNG files.
@@ -183,4 +186,5 @@ The `scene` package keeps a stack of scenes; the top one is active. Implement th
 - [TreeFrogUI](https://github.com/tzubertowski/TreeFrogUI) project family, for allowing those small devices to fly higher than anyone has imagined.
 - [NocturnalRTOS](https://github.com/Data-Frog-Central/NocturnalRTOS) project, from where I got the how-to of the framebuffer manipulation.
 - [font8x8](https://github.com/dhepper/font8x8), for the built-in bitmap font.
+- [Luiz Melo](https://luizmelo.itch.io) for the [Evil Wizard](https://luizmelo.itch.io/evil-wizard) sprite sheets used on the sprites example.
 - The contributors of the open source libs used in this project.
