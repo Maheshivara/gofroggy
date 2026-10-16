@@ -119,7 +119,7 @@ There are some examples on the [./examples](./examples) dir those are:
 | FPS        | ![FPS example](./docs/images/fps.png)               | Just a blue bar running on screen with a FPS meter                                   |
 | Input      | ![Input example](./docs/images/input.png)           | Screen where every button pressed is indicated                                       |
 | Primitives | ![Primitives example](./docs/images/primitives.png) | Small playground with some options to test the framework primitives                  |
-| Sprites    | ![Input example](./docs/images/primitives.png)      | Animating Luiz Melo [Evil Wizard](https://luizmelo.itch.io/evil-wizard) sprite sheet |
+| Sprites    | ![Sprites example](./docs/images/sprites.png)       | Animating Luiz Melo [Evil Wizard](https://luizmelo.itch.io/evil-wizard) sprite sheet |
 
 ## Display
 
