@@ -15,14 +15,14 @@ import (
 	"unsafe"
 )
 
-// FBIO_WAITFORVSYNC is _IOW('F', 32, uint32) in the generic ioctl encoding.
+// SF3000/MIPS uses the MIPS _IOW encoding (not the generic Linux value).
 const (
 	fbioGetVScreenInfo = 0x4600
 	fbioPutVScreenInfo = 0x4601
 	fbioGetFScreenInfo = 0x4602
 	fbioPanDisplay     = 0x4606
 	fbioBlank          = 0x4611
-	fbioWaitForVSync   = 0x40044620
+	fbioWaitForVSync   = 0x80044620
 )
 
 type fbBitfield struct {
@@ -107,7 +107,6 @@ func fbDetectRotation(xres, yres int) (int, string) {
 			if binary.BigEndian.Uint32(b) == 0 {
 				return 270, "device tree rotated-screen"
 			}
-			return 0, "device tree rotated-screen"
 		}
 	}
 
@@ -125,19 +124,21 @@ type FBDisplayController struct {
 	downscale   float64
 	vsyncActive bool
 
-	xmap   []int32 // panel x -> offset of its source pixel inside a row start
-	ystart []int32 // panel y -> index in buf where its source pixels start
-	srcX   []int32 // panel x -> buf row (rot 90/270) or buf column
-	srcY   []int32 // panel y -> buf column (rot 90/270) or buf row
-	fd     int
-	mem    []byte
-	pix    []uint16 // mem as RGB565 pixels
-	vinfo  fbVarScreeninfo
-	xres   int
-	yres   int
-	stride int // pixels per framebuffer row
-	pages  int // 1, or 2 when double buffered
-	back   int // page drawn into next
+	xmap       []int32 // panel x -> offset of its source pixel inside a row start
+	ystart     []int32 // panel y -> index in buf where its source pixels start
+	srcX       []int32 // panel x -> buf row (rot 90/270) or buf column
+	srcY       []int32 // panel y -> buf column (rot 90/270) or buf row
+	fd         int
+	mem        []byte
+	pix        []uint16 // mem as RGB565 pixels
+	vinfo      fbVarScreeninfo
+	xres       int
+	yres       int
+	stride     int    // pixels per framebuffer row
+	pages      int    // 1 or 2 output slots
+	pageIDs    [2]int // actual framebuffer page indices (not slot indices)
+	pagePrimed [2]bool
+	back       int // slot to draw next
 
 	pend [2]damage // changes each page has not received yet
 
@@ -153,7 +154,9 @@ type FBDisplayController struct {
 
 var _ DisplayController = (*FBDisplayController)(nil)
 
-// NewFBDisplayController opens /dev/fb0, forces RGB565 and maps it.
+// NewFBDisplayController opens /dev/fb0 without changing its display mode.
+// Requires exclusive control of the framebuffer: inactive pages are not
+// guaranteed to be unused by other software.
 func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	// Not os.OpenFile: an *os.File would close the fd when garbage collected.
 	fd, err := syscall.Open("/dev/fb0", syscall.O_RDWR, 0)
@@ -176,27 +179,18 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	}
 
 	panelW, panelH := int(v.Xres), int(v.Yres)
-
-	v.BitsPerPixel = 16
-	v.Red = fbBitfield{Offset: 11, Length: 5}
-	v.Green = fbBitfield{Offset: 5, Length: 6}
-	v.Blue = fbBitfield{Offset: 0, Length: 5}
-	v.Transp = fbBitfield{}
-	v.Xoffset, v.Yoffset = 0, 0
-	v.XresVirtual = v.Xres
-	v.YresVirtual = v.Yres * 2
-	if err := fbIoctl(fd, fbioPutVScreenInfo, unsafe.Pointer(&v)); err != nil {
-		v.YresVirtual = v.Yres // retry single buffered
-		if err := fbIoctl(fd, fbioPutVScreenInfo, unsafe.Pointer(&v)); err != nil {
-			return fail(fmt.Errorf("FBIOPUT_VSCREENINFO: %w", err))
-		}
+	// Do not force RGB565, resize the virtual framebuffer, or reset the pan
+	// offset. The vendor driver may have configured all of these already.
+	if v.BitsPerPixel != 16 ||
+		v.Red.Offset != 11 || v.Red.Length != 5 || v.Green.Offset != 5 ||
+		v.Green.Length != 6 || v.Blue.Offset != 0 || v.Blue.Length != 5 ||
+		v.Transp.Length != 0 {
+		return fail(fmt.Errorf("framebuffer mode is not RGB565: bpp=%d R=%v G=%v B=%v A=%v",
+			v.BitsPerPixel, v.Red, v.Green, v.Blue, v.Transp))
 	}
-
-	// The driver may have adjusted the values, so read them back.
-	_ = fbIoctl(fd, fbioGetFScreenInfo, unsafe.Pointer(&fix))
-	_ = fbIoctl(fd, fbioGetVScreenInfo, unsafe.Pointer(&v))
-	if v.BitsPerPixel != 16 {
-		return fail(fmt.Errorf("framebuffer is %d bpp, RGB565 not available", v.BitsPerPixel))
+	if panelW <= 0 || panelH <= 0 || int(v.XresVirtual) < panelW {
+		return fail(fmt.Errorf("invalid framebuffer geometry %dx%d virtual=%dx%d",
+			panelW, panelH, v.XresVirtual, v.YresVirtual))
 	}
 
 	rot, _ := fbDetectRotation(panelW, panelH)
@@ -215,17 +209,30 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	xres, yres := int(v.Xres), int(v.Yres)
 	stride := max(int(fix.LineLength)/2, xres)
 
-	pages := 1
-	if int(v.YresVirtual) >= yres*2 && int(fix.SmemLen) >= stride*yres*2*2 {
-		pages = 2
+	if fix.LineLength == 0 || int(fix.LineLength)%2 != 0 || stride < xres {
+		return fail(fmt.Errorf("invalid framebuffer line length %d", fix.LineLength))
 	}
+	// Only complete, addressable framebuffer pages may be used. Extra virtual
+	// height (15 pages on the observed SF3000) is preserved without modification.
+	pageBytes := stride * yres * 2
+	available := min(int(v.YresVirtual)/yres, int(fix.SmemLen)/pageBytes)
+	if available < 2 || int(v.Yoffset)%yres != 0 || v.Xoffset != 0 ||
+		int(v.Yoffset)/yres >= available {
+		return fail(fmt.Errorf("cannot safely select inactive framebuffer pages: pages=%d offset=(%d,%d)",
+			available, v.Xoffset, v.Yoffset))
+	}
+	// Pick two distinct pages different from the page currently displayed.
+	// The kernel does not expose page ownership: the caller must guarantee
+	// exclusive framebuffer access while this backend runs.
+	current := int(v.Yoffset) / yres
+	pageIDs := [2]int{(current + 1) % available, (current + 2) % available}
+	pages := 2
 
 	mem, err := syscall.Mmap(fd, 0, int(fix.SmemLen),
 		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return fail(fmt.Errorf("mmap /dev/fb0: %w", err))
 	}
-	clear(mem)
 
 	_ = fbIoctlVal(fd, fbioBlank, 0) // unblank
 
@@ -246,7 +253,8 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 		yres:        yres,
 		stride:      stride,
 		pages:       pages,
-		back:        pages - 1, // page 0 is on screen at start
+		pageIDs:     pageIDs,
+		back:        0, // first selected inactive page
 		check:       !cfg.DisableFrameCheck,
 		pend:        [2]damage{noDamage, noDamage},
 		rot:         rot,
@@ -327,13 +335,18 @@ func (d *FBDisplayController) Update() error {
 	}
 	d.pend[0] = d.pend[0].union(dm)
 	d.pend[1] = d.pend[1].union(dm)
+	// Each selected page must receive a complete first frame.
+	if !d.pagePrimed[d.back] {
+		d.pend[d.back] = d.fullDamage()
+	}
 
 	if d.pages == 1 && d.vsyncActive {
 		w := time.Now()
 		d.waitVSync()
 		wait = time.Since(w)
 	}
-	d.blit(d.back, d.pend[d.back])
+	d.blit(d.pageIDs[d.back], d.pend[d.back])
+	d.pagePrimed[d.back] = true
 	d.pend[d.back] = noDamage
 
 	d.lastCopy = time.Since(t) - wait
@@ -341,7 +354,7 @@ func (d *FBDisplayController) Update() error {
 
 	t = time.Now()
 	d.vinfo.Xoffset = 0
-	d.vinfo.Yoffset = uint32(d.back * d.yres)
+	d.vinfo.Yoffset = uint32(d.pageIDs[d.back] * d.yres)
 	if err := fbIoctl(d.fd, fbioPanDisplay, unsafe.Pointer(&d.vinfo)); err != nil {
 		return fmt.Errorf("FBIOPAN_DISPLAY: %w", err)
 	}

@@ -21,11 +21,11 @@ services:
       - CGO=0
       - GOOS=linux
       - GOARCH=mipsle
-      - GOMIPS=softfloat
+      - GOMIPS=hardfloat
     volumes:
       - ./out:/gofroggy/out
     user: "${MY_UID}:${MY_GID}"
-    command: [ "go", "build", "-C", "/gofroggy/examples/primitives", "-o", /gofroggy/out/primitives_bridge]
+    command: [ "go", "build", "-C", "/gofroggy/examples/primitives", "-o", /gofroggy/out/primitives_fb]
 
   cgo-builder:
     build:
@@ -34,14 +34,15 @@ services:
     env_file:
       - .env
     environment:
-      - CGO=1
-      - GOOS=linux
-      - GOARCH=mipsle
-      - GOMIPS=softfloat
-      - CC=/usr/local/bin/mips-gcc
-      - CGO_CFLAGS="-O2"
-      - CGO_LDFLAGS=""
+      CGO: "1"
+      CGO_ENABLED: "1"
+      GOOS: linux
+      GOARCH: mipsle
+      GOMIPS: hardfloat
+      CC: /usr/local/bin/mips-gcc
+      CGO_CFLAGS: "-O2"
+      CGO_LDFLAGS: ""
     volumes:
       - ./out:/gofroggy/out
     user: "${MY_UID}:${MY_GID}"
-    command: [ "go", "build", "-C", "/gofroggy/examples/primitives", "-o", /gofroggy/out/primitives_direct]
+    command: [ "go", "build", "-C", "/gofroggy/examples/fps", "-o", /gofroggy/out/fps_direct]

@@ -91,7 +91,7 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 		quit:         make(chan struct{}),
 	}
 	d.w, d.h = w, h
-	d.lw, d.lh = int(panelW), int(panelH)
+	d.lw, d.lh = resolveLogicalSize(cfg, w, h, int(panelW), int(panelH))
 	d.buf = make([]uint16, w*h)
 
 	ready := make(chan error, 1)
@@ -106,7 +106,10 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 
 		path := cfg.DriverPath
 		if path == "" {
-			path = "./driver_sf3000.so"
+			path, err = getDriverPath()
+			if err != nil {
+				path = "/usr/lib/driver.so"
+			}
 			if _, err := os.Stat(path); err != nil {
 				path = "/mnt/sdcard/cubegm/driver_sf3000.so"
 			}

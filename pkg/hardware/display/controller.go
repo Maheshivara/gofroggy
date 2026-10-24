@@ -22,10 +22,12 @@ type DisplayController interface {
 	// Height returns the render height in pixels.
 	Height() int
 
-	// LogicalSize returns the panel size; lay out your screen in it.
+	// LogicalSize returns the configured size when Width and Height are set,
+	// or the panel size otherwise; lay out your screen in it.
 	LogicalSize() (w, h int)
 
-	// Scale returns render pixels per logical pixel (1, 1 at native size).
+	// Scale returns render pixels per logical pixel (1, 1 when the
+	// configured Width and Height are used).
 	Scale() (sx, sy float64)
 
 	// Buffer returns the frame buffer (Width*Height RGB565 pixels, row by
@@ -135,8 +137,8 @@ func ParseBackend(s string) (Backend, error) {
 
 // Config controls how the display is driven. The zero value is valid.
 type Config struct {
-	// Width and Height set the render size and override Downscale. Rounded
-	// down to even numbers, at most 1280x720.
+	// Width and Height set both the render and logical size, overriding
+	// Downscale. Rounded down to even numbers, at most 1280x720.
 	Width, Height int
 
 	// Downscale divides the panel size (fractional is fine, e.g. 1.9).
@@ -301,6 +303,15 @@ func resolveSize(cfg Config, panelW, panelH int) (w, h int, err error) {
 	}
 
 	return w, h, nil
+}
+
+// resolveLogicalSize returns the explicit render dimensions as the logical
+// dimensions too. With no explicit size, layout uses the physical panel size.
+func resolveLogicalSize(cfg Config, renderW, renderH, panelW, panelH int) (int, int) {
+	if cfg.Width > 0 && cfg.Height > 0 {
+		return renderW, renderH
+	}
+	return panelW, panelH
 }
 
 // readPanelSize returns the panel resolution reported by /dev/fb0 before the

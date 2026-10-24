@@ -73,8 +73,20 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	if cfg.UpdateScreen {
 		args = append(args, "--update-screen")
 	}
+
+	path := cfg.DriverPath
+	if path == "" {
+		path, err = getDriverPath()
+		if err != nil {
+			path = "/usr/lib/driver.so"
+		}
+		if _, err := os.Stat(path); err != nil {
+			path = "/mnt/sdcard/cubegm/driver_sf3000.so"
+		}
+	}
+
 	if cfg.DriverPath != "" {
-		args = append(args, "--driver", cfg.DriverPath)
+		args = append(args, "--driver", path)
 	}
 	cmd := exec.Command(bridgePath, args...)
 

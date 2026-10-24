@@ -192,7 +192,7 @@ func (app *Application) Run() {
 
 func main() {
 
-	cfg := display.Config{Width: 0, Height: 0, Downscale: 1, VSync: false, UpdateScreen: false, Backend: display.BackendAuto}
+	cfg := display.Config{Downscale: 1, VSync: false, UpdateScreen: false, Backend: display.BackendAuto}
 
 	var err error
 	logFile, err = os.OpenFile("/mnt/sdcard/test.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)

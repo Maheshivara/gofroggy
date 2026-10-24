@@ -11,17 +11,17 @@ import (
 	"unsafe"
 )
 
-// frame is the frame buffer and drawing code shared by both backends.
+// frame is the frame buffer and drawing code shared by all backends.
 type frame struct {
 	w, h   int // render size
-	lw, lh int // logical size (the panel size)
+	lw, lh int // logical size (configured size or panel size)
 	buf    []uint16
 
 	prev   []uint16 // the frame as last compared (see framecheck.go)
 	primed bool     // prev holds a frame
 }
 
-// LogicalSize returns the panel size.
+// LogicalSize returns the configured logical size, or the panel size.
 func (f *frame) LogicalSize() (int, int) {
 	if f.lw <= 0 || f.lh <= 0 {
 		return f.w, f.h

@@ -1,14 +1,39 @@
 #!/bin/sh
-GCC=/opt/mipsel-buildroot-linux-gnu_sdk-buildroot/bin/mips-mti-linux-gnu-gcc
 
-# Drop the architecture/float flags Go injects, for some reason they conflict with the multilib selection
-n=$#; i=0
-while [ $i -lt $n ]; do
-  a=$1; shift; i=$((i+1))
-  case "$a" in
-    -march=*|-mabi=*|-mhard-float|-msoft-float|-mfp32|-mfp64|-mfpxx|-modd-spreg|-mno-odd-spreg|-mips32*) ;;
-    *) set -- "$@" "$a" ;;
-  esac
+ARGS=$(mktemp) || exit 1
+trap 'rm -f "$ARGS"' EXIT HUP INT TERM
+
+for arg do
+    case "$arg" in
+        -march=*|-mips32|-mips32r2|-mips32r3|-mips32r5|-mips32r6|-mhard-float|-msoft-float)
+            ;;
+        *)
+            printf '%s\n' "$arg" >> "$ARGS"
+            ;;
+    esac
 done
 
-exec "$GCC" -march=mips32r2 "$@"
+set --
+while IFS= read -r arg; do
+    set -- "$@" "$arg"
+done < "$ARGS"
+
+rm -f "$ARGS"
+trap - EXIT HUP INT TERM
+
+TOOLCHAIN=/opt/mipsel-buildroot-linux-gnu_sdk-buildroot
+GCC="$TOOLCHAIN/bin/mips-mti-linux-gnu-gcc"
+SYSROOT="$TOOLCHAIN/opt/ext-toolchain/sysroot"
+HARDROOT="$SYSROOT/mipsel-r2-hard"
+
+exec "$GCC" \
+    "$@" \
+    -EL \
+    -march=mips32r2 \
+    -mhard-float \
+    --sysroot="$SYSROOT" \
+    -isystem "$HARDROOT/usr/include" \
+    -B"$HARDROOT/usr/lib/" \
+    -L"$HARDROOT/usr/lib" \
+    -L"$HARDROOT/lib" \
+    -Wl,--sysroot="$SYSROOT"
