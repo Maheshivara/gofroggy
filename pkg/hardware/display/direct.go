@@ -32,10 +32,12 @@ func init() {
 type DirectDisplayController struct {
 	frame
 
-	downscale    float64 // effective factor: panel width / render width
-	vsyncActive  bool
-	updateScreen bool
-	frameSize    int
+	downscale        float64 // effective factor: panel width / render width
+	vsyncActive      bool
+	updateScreen     bool
+	frameSize        int
+	outputW, outputH int
+	stagePrimed      [2]bool
 
 	stage [2]unsafe.Pointer // C-allocated staging buffers
 	next  int               // staging buffer for the next frame
@@ -65,13 +67,14 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 	panelW, panelH := C.int(854), C.int(480)
 	C.dd_fb_open(&panelW, &panelH)
 
-	w, h, err := resolveSize(cfg, int(panelW), int(panelH))
-	if err != nil {
+	var baseFrame frame
+	if err := baseFrame.configure(cfg, int(panelW), int(panelH)); err != nil {
 		C.dd_fb_close()
 		return nil, err
 	}
-	frameSize := w * h * 2
-	pitch := C.int(w * 2)
+	outputW, outputH := baseFrame.presentation.width, baseFrame.presentation.height
+	frameSize := outputW * outputH * 2
+	pitch := C.int(outputW * 2)
 
 	// Probe the vsync ioctl once so the caller learns whether it really works.
 	vsyncOK := false
@@ -80,19 +83,18 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 	}
 
 	d := &DirectDisplayController{
-		downscale:    float64(panelW) / float64(w),
+		downscale:    float64(panelW) / float64(baseFrame.w),
 		vsyncActive:  vsyncOK,
 		updateScreen: cfg.UpdateScreen,
 		frameSize:    frameSize,
-		pend:         [2]damage{noDamage, noDamage},
-		check:        !cfg.DisableFrameCheck,
-		req:          make(chan int, 1),
-		done:         make(chan directTiming, 1),
-		quit:         make(chan struct{}),
+		outputW:      outputW, outputH: outputH,
+		pend:  [2]damage{noDamage, noDamage},
+		check: !cfg.DisableFrameCheck,
+		req:   make(chan int, 1),
+		done:  make(chan directTiming, 1),
+		quit:  make(chan struct{}),
 	}
-	d.w, d.h = w, h
-	d.lw, d.lh = resolveLogicalSize(cfg, w, h, int(panelW), int(panelH))
-	d.buf = make([]uint16, w*h)
+	d.frame = baseFrame
 
 	ready := make(chan error, 1)
 	update := C.int(0)
@@ -106,8 +108,9 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 
 		path := cfg.DriverPath
 		if path == "" {
-			path, err = getDriverPath()
-			if err != nil {
+			var pathErr error
+			path, pathErr = getDriverPath()
+			if pathErr != nil {
 				path = "/usr/lib/driver.so"
 			}
 			if _, err := os.Stat(path); err != nil {
@@ -149,7 +152,7 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 				tm.wait = time.Since(t)
 			}
 			t := time.Now()
-			C.dd_show(stage[idx], C.int(w), C.int(h), pitch, update)
+			C.dd_show(stage[idx], C.int(outputW), C.int(outputH), pitch, update)
 			tm.show = time.Since(t)
 			d.done <- tm
 		}
@@ -166,48 +169,40 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 	return d, nil
 }
 
-// Update copies what changed into the idle staging buffer and presents it in
-// the background. A frame identical to the last one is skipped. It blocks only
-// while the previous frame is still presenting.
+// Update stages changed pixels and presents them on the vendor thread.
+// It waits only if the previous frame is still presenting.
 func (d *DirectDisplayController) Update() error {
 	if d.req == nil || len(d.buf) == 0 {
 		return nil
 	}
 
-	// Compare first: the driver thread may still be presenting the last frame.
+	// Compare before waiting for the preceding frame.
 	t := time.Now()
-	dm := d.fullDamage()
-	if d.check {
-		if dm = d.diff(); dm.empty() {
-			d.lastCopy = time.Since(t)
-			d.skipped++
-			return nil
-		}
+	dm := d.changed(d.check)
+	if dm.empty() {
+		d.lastCopy = time.Since(t)
+		d.skipped++
+		return nil
 	}
-	diffTime := time.Since(t)
-
+	compareTime := time.Since(t)
 	if d.pending {
 		tm := <-d.done
 		d.lastWait, d.lastShow = tm.wait, tm.show
 		d.pending = false
 	}
-
 	i := d.next
 	d.next ^= 1
-
-	// The buffer about to be filled is a frame behind, so it also needs what
-	// changed since it was last filled: copy whole rows covering both.
 	d.pend[0] = d.pend[0].union(dm)
 	d.pend[1] = d.pend[1].union(dm)
 	rows := d.pend[i]
 	d.pend[i] = noDamage
-
 	t = time.Now()
-	rowBytes := d.w * 2
-	C.dd_copy(unsafe.Add(d.stage[i], rows.r0*rowBytes),
-		unsafe.Pointer(&d.buf[rows.r0*d.w]),
-		C.size_t((rows.r1-rows.r0+1)*rowBytes))
-	d.lastCopy = diffTime + time.Since(t)
+	dst := unsafe.Slice((*uint16)(d.stage[i]), d.outputW*d.outputH)
+	if _, err := d.presentation.compose(dst, d.buf, d.w, d.h, rows, !d.stagePrimed[i]); err != nil {
+		return err
+	}
+	d.stagePrimed[i] = true
+	d.lastCopy = compareTime + time.Since(t)
 
 	d.req <- i
 	d.pending = true

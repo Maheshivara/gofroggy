@@ -13,9 +13,10 @@ import (
 
 // frame is the frame buffer and drawing code shared by all backends.
 type frame struct {
-	w, h   int // render size
-	lw, lh int // logical size (configured size or panel size)
-	buf    []uint16
+	w, h         int // render size
+	lw, lh       int // logical size (configured size or panel size)
+	buf          []uint16
+	presentation presentation
 
 	prev   []uint16 // the frame as last compared (see framecheck.go)
 	primed bool     // prev holds a frame
@@ -200,9 +201,8 @@ func (f *frame) fullDamage() damage {
 	return damage{0, f.h - 1, 0, f.w - 1}
 }
 
-// diff compares buf with the previous frame, refreshes prev for what changed
-// and returns the bounding box of the changes (empty if there are none). The
-// first call counts as a full change, so the first frame is always shown.
+// diff returns the changed bounding box and updates the previous image.
+// The first comparison always reports a full frame.
 func (f *frame) diff() damage {
 	w, h := f.w, f.h
 

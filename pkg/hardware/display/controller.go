@@ -64,9 +64,9 @@ type DisplayController interface {
 	Close()
 }
 
-// Stats holds the active configuration and the latest timings.
+// Stats holds active display settings and recent frame timings.
 type Stats struct {
-	// Backend is "direct", "bridge" or "fb".
+	// Backend identifies "direct", "bridge", "fb", or "ge".
 	Backend string
 
 	// Downscale is panel width divided by render width.
@@ -104,9 +104,12 @@ const (
 
 	// BackendFB writes straight to /dev/fb0 and bypasses the vendor driver.
 	BackendFB
+
+	// BackendGE uses pure-Go SF3000 graphics-engine hardware.
+	BackendGE
 )
 
-// String returns "auto", "bridge", "direct" or "fb".
+// String returns the backend name.
 func (b Backend) String() string {
 	switch b {
 	case BackendBridge:
@@ -115,12 +118,14 @@ func (b Backend) String() string {
 		return "direct"
 	case BackendFB:
 		return "fb"
+	case BackendGE:
+		return "ge"
 	default:
 		return "auto"
 	}
 }
 
-// ParseBackend parses "auto", "bridge", "direct" ("cgo" also means direct) or "fb".
+// ParseBackend parses the backend name ("cgo" also selects direct).
 func ParseBackend(s string) (Backend, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto":
@@ -131,14 +136,20 @@ func ParseBackend(s string) (Backend, error) {
 		return BackendDirect, nil
 	case "fb":
 		return BackendFB, nil
+	case "ge":
+		return BackendGE, nil
 	}
-	return BackendAuto, fmt.Errorf("unknown display backend %q (want auto, bridge, direct or fb)", s)
+	return BackendAuto, fmt.Errorf("unknown display backend %q (want auto, bridge, direct, fb or ge)", s)
 }
 
 // Config controls how the display is driven. The zero value is valid.
 type Config struct {
-	// Width and Height set both the render and logical size, overriding
-	// Downscale. Rounded down to even numbers, at most 1280x720.
+	// BackgroundColor is the RGB565 color outside an explicitly smaller image.
+	// The default is black (0x0000).
+	BackgroundColor uint16
+
+	// Width and Height select the render size, overriding Downscale.
+	// Smaller explicit sizes are centered without scaling.
 	Width, Height int
 
 	// Downscale divides the panel size (fractional is fine, e.g. 1.9).
@@ -169,10 +180,8 @@ type Config struct {
 	// only what changed is copied.
 	DisableFrameCheck bool
 
-	// Rotation forces the render to be rotated clockwise by this angle on its
-	// way to the screen, instead of the rotation the device reports. Only
-	// the fb backend uses it; the others leave rotation to the vendor
-	// driver. RotationNone (the default) keeps the device's own rotation.
+	// Rotation overrides detected rotation for FB; GE supports none/c90.
+	// Bridge and Direct leave rotation to the vendor driver.
 	Rotation Rotation
 }
 
@@ -250,6 +259,10 @@ func NewDisplayController(cfg Config) (DisplayController, error) {
 		backend = BackendDirect
 	case BackendBridge:
 		backend = BackendBridge
+	case BackendGE:
+		backend = BackendGE
+	case BackendFB:
+		backend = BackendFB
 	default:
 		if directCtor != nil {
 			backend = BackendDirect
@@ -261,6 +274,10 @@ func NewDisplayController(cfg Config) (DisplayController, error) {
 			return nil, ErrCGODisabled
 		}
 		return directCtor(cfg)
+	}
+
+	if backend == BackendGE {
+		return NewGEDisplayController(cfg)
 	}
 
 	if backend == BackendBridge {

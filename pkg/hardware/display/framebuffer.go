@@ -117,7 +117,7 @@ func fbDetectRotation(xres, yres int) (int, string) {
 }
 
 // FBDisplayController draws straight into /dev/fb0, without cgo or a vendor
-// driver. A render smaller than the panel is upscaled by the CPU.
+// driver. Explicitly smaller images are centered on a colored background.
 type FBDisplayController struct {
 	frame
 
@@ -155,8 +155,7 @@ type FBDisplayController struct {
 var _ DisplayController = (*FBDisplayController)(nil)
 
 // NewFBDisplayController opens /dev/fb0 without changing its display mode.
-// Requires exclusive control of the framebuffer: inactive pages are not
-// guaranteed to be unused by other software.
+// Inactive framebuffer pages require exclusive ownership.
 func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	// Not os.OpenFile: an *os.File would close the fd when garbage collected.
 	fd, err := syscall.Open("/dev/fb0", syscall.O_RDWR, 0)
@@ -201,10 +200,11 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	// The app always sees the landscape panel, whatever the fb mode is.
 	lw, lh := max(panelW, panelH), min(panelW, panelH)
 
-	w, h, err := resolveSize(cfg, lw, lh)
-	if err != nil {
+	var baseFrame frame
+	if err := baseFrame.configure(cfg, lw, lh); err != nil {
 		return fail(err)
 	}
+	w := baseFrame.w
 
 	xres, yres := int(v.Xres), int(v.Yres)
 	stride := max(int(fix.LineLength)/2, xres)
@@ -216,7 +216,7 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	// height (15 pages on the observed SF3000) is preserved without modification.
 	pageBytes := stride * yres * 2
 	available := min(int(v.YresVirtual)/yres, int(fix.SmemLen)/pageBytes)
-	if available < 2 || int(v.Yoffset)%yres != 0 || v.Xoffset != 0 ||
+	if available < 3 || int(v.Yoffset)%yres != 0 || v.Xoffset != 0 ||
 		int(v.Yoffset)/yres >= available {
 		return fail(fmt.Errorf("cannot safely select inactive framebuffer pages: pages=%d offset=(%d,%d)",
 			available, v.Xoffset, v.Yoffset))
@@ -260,9 +260,7 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 		rot:         rot,
 		row:         make([]uint16, xres),
 	}
-	d.w, d.h = w, h
-	d.lw, d.lh = lw, lh
-	d.buf = make([]uint16, w*h)
+	d.frame = baseFrame
 
 	d.initMaps()
 
@@ -272,6 +270,10 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 // initMaps precomputes where every panel pixel comes from. A panel pixel's
 // source index in buf is xmap[x] + ystart[y], for any rotation.
 func (d *FBDisplayController) initMaps() {
+	if d.presentation.centered {
+		d.initCenteredMaps()
+		return
+	}
 	d.xmap = make([]int32, d.xres)
 	d.ystart = make([]int32, d.yres)
 	d.srcX = make([]int32, d.xres)
@@ -325,9 +327,9 @@ func (d *FBDisplayController) Update() error {
 	var wait time.Duration
 	t := time.Now()
 
-	dm := d.fullDamage()
+	dm := d.changed(d.check)
 	if d.check {
-		if dm = d.diff(); dm.empty() {
+		if dm.empty() {
 			d.lastCopy = time.Since(t)
 			d.skipped++
 			return nil
@@ -375,10 +377,92 @@ func (d *FBDisplayController) waitVSync() {
 	_ = fbIoctl(d.fd, fbioWaitForVSync, unsafe.Pointer(&zero))
 }
 
-// blit updates the part of a page covered by dm: the fb rows and columns whose
-// source pixels lie inside it. Each row is built in a cached scratch row and
-// copied whole, so the slow framebuffer memory is only written, in order.
+// initCenteredMaps maps panel pixels to the active rectangle once.
+// Invalid coordinates use -1 so background pixels are never sampled.
+func (d *FBDisplayController) initCenteredMaps() {
+	p := d.presentation
+	d.xmap = make([]int32, d.xres)
+	d.ystart = make([]int32, d.yres)
+	d.srcX = make([]int32, d.xres)
+	d.srcY = make([]int32, d.yres)
+
+	for x := 0; x < d.xres; x++ {
+		var coordinate, offset, extent int
+		if d.rot == 90 || d.rot == 270 {
+			coordinate = x * p.height / d.xres
+			if d.rot == 90 {
+				coordinate = p.height - 1 - coordinate
+			}
+			offset, extent = p.y, d.h
+		} else {
+			coordinate = x * p.width / d.xres
+			if d.rot == 180 {
+				coordinate = p.width - 1 - coordinate
+			}
+			offset, extent = p.x, d.w
+		}
+		index := coordinate - offset
+		if index < 0 || index >= extent {
+			d.srcX[x], d.xmap[x] = -1, -1
+			continue
+		}
+		d.srcX[x] = int32(index)
+		if d.rot == 90 || d.rot == 270 {
+			d.xmap[x] = int32(index * d.w)
+		} else {
+			d.xmap[x] = int32(index)
+		}
+	}
+
+	for y := 0; y < d.yres; y++ {
+		var coordinate, offset, extent int
+		if d.rot == 90 || d.rot == 270 {
+			coordinate = y * p.width / d.yres
+			if d.rot == 270 {
+				coordinate = p.width - 1 - coordinate
+			}
+			offset, extent = p.x, d.w
+		} else {
+			coordinate = y * p.height / d.yres
+			if d.rot == 180 {
+				coordinate = p.height - 1 - coordinate
+			}
+			offset, extent = p.y, d.h
+		}
+		index := coordinate - offset
+		if index < 0 || index >= extent {
+			d.srcY[y], d.ystart[y] = -1, -1
+			continue
+		}
+		d.srcY[y] = int32(index)
+		if d.rot == 90 || d.rot == 270 {
+			d.ystart[y] = int32(index)
+		} else {
+			d.ystart[y] = int32(index * d.w)
+		}
+	}
+}
+
+// fillCenteredBackground initializes one output page's margins.
+// Subsequent frames only touch pixels in the changed rectangle.
+func (d *FBDisplayController) fillCenteredBackground(page int) {
+	fillPixels(d.row[:d.xres], d.presentation.color)
+	base := page * d.yres * d.stride
+	for y := 0; y < d.yres; y++ {
+		o := base + y*d.stride
+		copy(d.pix[o:o+d.xres], d.row[:d.xres])
+	}
+}
+
+// blit copies changed pixels into the inactive framebuffer page.
+// Precomputed coordinate maps keep division out of the render loop.
 func (d *FBDisplayController) blit(page int, dm damage) {
+	if dm.empty() {
+		return
+	}
+	if d.presentation.centered && !d.pagePrimed[d.back] {
+		d.fillCenteredBackground(page)
+	}
 	base := page * d.yres * d.stride
 
 	if d.rot == 0 && d.w == d.xres && d.h == d.yres && d.stride == d.xres &&
@@ -387,8 +471,19 @@ func (d *FBDisplayController) blit(page int, dm damage) {
 		return
 	}
 
-	// Rotated by 90/270, panel columns come from buf rows, otherwise from
-	// buf columns.
+	// A native, nonrotated centered rectangle can copy source rows directly.
+	p := d.presentation
+	if p.centered && d.rot == 0 && p.width == d.xres && p.height == d.yres {
+		n := dm.c1 - dm.c0 + 1
+		for y := dm.r0; y <= dm.r1; y++ {
+			src := y*d.w + dm.c0
+			dst := base + (p.y+y)*d.stride + p.x + dm.c0
+			copy(d.pix[dst:dst+n], d.buf[src:src+n])
+		}
+		return
+	}
+
+	// Rotated output columns map to source rows; otherwise to columns.
 	xlo, xhi, ylo, yhi := dm.c0, dm.c1, dm.r0, dm.r1
 	if d.rot == 90 || d.rot == 270 {
 		xlo, xhi, ylo, yhi = dm.r0, dm.r1, dm.c0, dm.c1
