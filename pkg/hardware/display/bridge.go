@@ -19,7 +19,6 @@ import (
 type BridgeDisplayController struct {
 	frame
 
-	downscale   float64 // effective factor: panel width / render width
 	vsyncActive bool
 
 	lastCopy, lastWait, lastShow time.Duration
@@ -195,7 +194,6 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	}
 
 	d := &BridgeDisplayController{
-		downscale:    float64(panelW) / float64(baseFrame.w),
 		vsyncActive:  vsyncOK,
 		check:        !cfg.DisableFrameCheck,
 		rowsOK:       rowsOK,
@@ -275,7 +273,6 @@ func (d *BridgeDisplayController) Update() error {
 func (d *BridgeDisplayController) Stats() Stats {
 	return Stats{
 		Backend:     "bridge",
-		Downscale:   d.downscale,
 		VSyncActive: d.vsyncActive,
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,

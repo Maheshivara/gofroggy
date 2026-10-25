@@ -117,11 +117,10 @@ func fbDetectRotation(xres, yres int) (int, string) {
 }
 
 // FBDisplayController draws straight into /dev/fb0, without cgo or a vendor
-// driver. Explicitly smaller images are centered on a colored background.
+// driver. Center and Fit can display colored background bars.
 type FBDisplayController struct {
 	frame
 
-	downscale   float64
 	vsyncActive bool
 
 	xmap       []int32 // panel x -> offset of its source pixel inside a row start
@@ -145,9 +144,22 @@ type FBDisplayController struct {
 	check   bool   // compare frames, skipping or shrinking unchanged ones
 	skipped uint64 // frames skipped because they were identical
 
-	rot int // clockwise degrees the frame is rotated by on the way out
+	rot           int             // clockwise degrees the frame is rotated by on the way out
+	rotSource     string          // detection or explicit override
+	originalVInfo fbVarScreeninfo // framebuffer mode/pan at initialization
+	lastPage      int             // last page successfully displayed by this controller
+	panChanged    bool
 
-	row []uint16 // scratch row, so the framebuffer is never read
+	row []uint16 // retained for the reference blitter and compatibility tests
+
+	// surface is the final, rotated RGB565 image in framebuffer coordinates.
+	// Drawing operations update it directly via the precomputed inverse maps.
+	surface        []uint16
+	surfaceReady   bool
+	surfaceSync    bool   // Clear or raw writes require final-pixel reconciliation
+	rawAccess      bool   // Buffer and SetBuffer can change without drawing calls
+	surfaceTouched damage // direct writes since the previous successful Update
+	invX, invY     []fbSpan
 
 	lastCopy, lastWait, lastShow time.Duration
 }
@@ -192,9 +204,10 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 			panelW, panelH, v.XresVirtual, v.YresVirtual))
 	}
 
-	rot, _ := fbDetectRotation(panelW, panelH)
+	rot, rotSource := fbDetectRotation(panelW, panelH)
 	if cfg.Rotation != RotationNone {
 		rot = cfg.Rotation.Degrees() // forced, instead of the device's
+		rotSource = "Config.Rotation=" + cfg.Rotation.String()
 	}
 
 	// The app always sees the landscape panel, whatever the fb mode is.
@@ -204,7 +217,6 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	if err := baseFrame.configure(cfg, lw, lh); err != nil {
 		return fail(err)
 	}
-	w := baseFrame.w
 
 	xres, yres := int(v.Xres), int(v.Yres)
 	stride := max(int(fix.LineLength)/2, xres)
@@ -243,132 +255,345 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	}
 
 	d := &FBDisplayController{
-		downscale:   float64(lw) / float64(w),
-		vsyncActive: vsyncOK,
-		fd:          fd,
-		mem:         mem,
-		pix:         unsafe.Slice((*uint16)(unsafe.Pointer(&mem[0])), len(mem)/2),
-		vinfo:       v,
-		xres:        xres,
-		yres:        yres,
-		stride:      stride,
-		pages:       pages,
-		pageIDs:     pageIDs,
-		back:        0, // first selected inactive page
-		check:       !cfg.DisableFrameCheck,
-		pend:        [2]damage{noDamage, noDamage},
-		rot:         rot,
-		row:         make([]uint16, xres),
+		vsyncActive:   vsyncOK,
+		fd:            fd,
+		mem:           mem,
+		pix:           unsafe.Slice((*uint16)(unsafe.Pointer(&mem[0])), len(mem)/2),
+		vinfo:         v,
+		xres:          xres,
+		yres:          yres,
+		stride:        stride,
+		pages:         pages,
+		pageIDs:       pageIDs,
+		back:          0, // first selected inactive page
+		check:         !cfg.DisableFrameCheck,
+		pend:          [2]damage{noDamage, noDamage},
+		rot:           rot,
+		rotSource:     rotSource,
+		originalVInfo: v,
+		row:           make([]uint16, xres),
 	}
 	d.frame = baseFrame
 
 	d.initMaps()
+	d.initOperationSurface()
 
 	return d, nil
 }
 
-// initMaps precomputes where every panel pixel comes from. A panel pixel's
-// source index in buf is xmap[x] + ystart[y], for any rotation.
+// fbSampleCenter maps destination pixel centers to source pixel centers.
+// Unlike edge-aligned division, it avoids a consistent one-sided bias.
+func fbSampleCenter(i, source, destination int) int {
+	return int((int64(2*i+1) * int64(source)) / (2 * int64(destination)))
+}
+
+// initMaps combines display rotation and presentation scaling once.
+// An invalid coordinate (-1) identifies a background bar.
 func (d *FBDisplayController) initMaps() {
-	if d.presentation.centered {
-		d.initCenteredMaps()
-		return
-	}
+	p := d.presentation
 	d.xmap = make([]int32, d.xres)
 	d.ystart = make([]int32, d.yres)
 	d.srcX = make([]int32, d.xres)
 	d.srcY = make([]int32, d.yres)
 
-	if d.rot == 90 || d.rot == 270 {
-		for x := range d.xmap {
-			row := x * d.h / d.xres
-			if d.rot == 90 {
-				row = d.h - 1 - row
+	// Stretch preserves its established rotation direction.
+	oldStretch := p.mode == ScalingStretch
+	for x := 0; x < d.xres; x++ {
+		if d.rot == 90 || d.rot == 270 {
+			coord := fbSampleCenter(x, p.height, d.xres)
+			if d.rot == 90 && !oldStretch {
+				coord = p.height - 1 - coord
 			}
-			d.xmap[x] = int32(row * d.w)
-			d.srcX[x] = int32(row)
-		}
-		for y := range d.ystart {
-			col := y * d.w / d.yres
-			if d.rot == 270 {
-				col = d.w - 1 - col
+			sy := p.ymap[coord]
+			if d.rot == 90 && oldStretch && sy >= 0 {
+				sy = d.h - 1 - sy
 			}
-			d.ystart[y] = int32(col)
-			d.srcY[y] = int32(col)
+			d.srcX[x] = int32(sy)
+			if sy < 0 {
+				d.xmap[x] = -1
+			} else {
+				d.xmap[x] = int32(sy * d.w)
+			}
+		} else {
+			coord := fbSampleCenter(x, p.width, d.xres)
+			if d.rot == 180 && !oldStretch {
+				coord = p.width - 1 - coord
+			}
+			sx := p.xmap[coord]
+			if d.rot == 180 && oldStretch && sx >= 0 {
+				sx = d.w - 1 - sx
+			}
+			d.srcX[x] = int32(sx)
+			d.xmap[x] = int32(sx)
 		}
-		return
 	}
-
-	for x := range d.xmap {
-		col := x * d.w / d.xres
-		if d.rot == 180 {
-			col = d.w - 1 - col
+	for y := 0; y < d.yres; y++ {
+		if d.rot == 90 || d.rot == 270 {
+			coord := fbSampleCenter(y, p.width, d.yres)
+			if d.rot == 270 && !oldStretch {
+				coord = p.width - 1 - coord
+			}
+			sx := p.xmap[coord]
+			if d.rot == 270 && oldStretch && sx >= 0 {
+				sx = d.w - 1 - sx
+			}
+			d.srcY[y] = int32(sx)
+			d.ystart[y] = int32(sx)
+		} else {
+			coord := fbSampleCenter(y, p.height, d.yres)
+			if d.rot == 180 && !oldStretch {
+				coord = p.height - 1 - coord
+			}
+			sy := p.ymap[coord]
+			if d.rot == 180 && oldStretch && sy >= 0 {
+				sy = d.h - 1 - sy
+			}
+			d.srcY[y] = int32(sy)
+			if sy < 0 {
+				d.ystart[y] = -1
+			} else {
+				d.ystart[y] = int32(sy * d.w)
+			}
 		}
-		d.xmap[x] = int32(col)
-		d.srcX[x] = int32(col)
-	}
-	for y := range d.ystart {
-		row := y * d.h / d.yres
-		if d.rot == 180 {
-			row = d.h - 1 - row
-		}
-		d.ystart[y] = int32(row * d.w)
-		d.srcY[y] = int32(row)
 	}
 }
 
-// Update copies what changed into the idle page and flips to it. A frame
-// identical to the last one costs only the comparison.
+// fbSpan is the inclusive physical range covered by a logical coordinate.
+// Empty spans describe pixels discarded by noninteger downsampling.
+type fbSpan struct{ lo, hi int }
+
+func (s fbSpan) empty() bool { return s.hi < s.lo }
+
+// initOperationSurface prepares the inverse rotation/scaling maps once.
+// Physical output is retained independently of the two framebuffer pages.
+func (d *FBDisplayController) initOperationSurface() {
+	d.surface = make([]uint16, d.xres*d.yres)
+	d.invX = make([]fbSpan, d.w)
+	d.invY = make([]fbSpan, d.h)
+	for i := range d.invX {
+		d.invX[i] = fbSpan{0, -1}
+	}
+	for i := range d.invY {
+		d.invY[i] = fbSpan{0, -1}
+	}
+	for x, v := range d.srcX {
+		if v < 0 {
+			continue
+		}
+		if d.rot == 90 || d.rot == 270 {
+			d.invY[v] = extendFBSpan(d.invY[v], x)
+		} else {
+			d.invX[v] = extendFBSpan(d.invX[v], x)
+		}
+	}
+	for y, v := range d.srcY {
+		if v < 0 {
+			continue
+		}
+		if d.rot == 90 || d.rot == 270 {
+			d.invX[v] = extendFBSpan(d.invX[v], y)
+		} else {
+			d.invY[v] = extendFBSpan(d.invY[v], y)
+		}
+	}
+	d.surfaceTouched = noDamage
+}
+
+func extendFBSpan(s fbSpan, value int) fbSpan {
+	if s.empty() {
+		return fbSpan{value, value}
+	}
+	if value < s.lo {
+		s.lo = value
+	}
+	if value > s.hi {
+		s.hi = value
+	}
+	return s
+}
+
+func rangeFBSpan(spans []fbSpan, first, last int) fbSpan {
+	out := fbSpan{0, -1}
+	first = max(first, 0)
+	last = min(last, len(spans)-1)
+	for i := first; i <= last; i++ {
+		if !spans[i].empty() {
+			out = extendFBSpan(out, spans[i].lo)
+			out = extendFBSpan(out, spans[i].hi)
+		}
+	}
+	return out
+}
+
+// physicalDamage maps a logical rectangle to the destination pixel bounds.
+// It also handles pixels lost to unavoidable physical downsampling.
+func (d *FBDisplayController) physicalDamage(dm damage) damage {
+	if dm.empty() {
+		return noDamage
+	}
+	px, py := rangeFBSpan(d.invX, dm.c0, dm.c1), rangeFBSpan(d.invY, dm.r0, dm.r1)
+	if px.empty() || py.empty() {
+		return noDamage
+	}
+	if d.rot == 90 || d.rot == 270 {
+		return damage{px.lo, px.hi, py.lo, py.hi}
+	}
+	return damage{py.lo, py.hi, px.lo, px.hi}
+}
+
+// paintPhysical applies a logical dirty rectangle directly to the rotated surface.
+// The output never needs to be resampled again when switching framebuffer pages.
+func (d *FBDisplayController) paintPhysical(dm damage) {
+	phys := d.physicalDamage(dm)
+	if phys.empty() {
+		return
+	}
+	for y := phys.r0; y <= phys.r1; y++ {
+		row := y * d.xres
+		for x := phys.c0; x <= phys.c1; x++ {
+			a, b := d.xmap[x], d.ystart[y]
+			if a >= 0 && b >= 0 {
+				d.surface[row+x] = d.buf[a+b]
+			} else {
+				d.surface[row+x] = d.presentation.color
+			}
+		}
+	}
+}
+
+// syncSurface reconciles drawing and raw writes against the final logical image.
+// Full clears are deferred, avoiding redundant rotated writes before Update.
+func (d *FBDisplayController) syncSurface(dm damage) {
+	if !d.surfaceReady {
+		fillPixels(d.surface, d.presentation.color)
+		d.paintPhysical(d.fullDamage())
+		d.surfaceReady = true
+	} else if d.surfaceSync {
+		d.paintPhysical(dm.union(d.surfaceTouched))
+	}
+	d.surfaceSync = false
+	d.surfaceTouched = noDamage
+}
+
+// SetPixel writes the logical buffer and updates its rotated destination.
+func (d *FBDisplayController) SetPixel(x, y int, color uint16) {
+	if x < 0 || y < 0 || x >= d.w || y >= d.h {
+		return
+	}
+	if d.buf[y*d.w+x] == color {
+		return
+	}
+	d.frame.SetPixel(x, y, color)
+	if d.surfaceReady && !d.surfaceSync {
+		d.paintPhysical(damage{y, y, x, x})
+		d.surfaceTouched = d.surfaceTouched.union(damage{y, y, x, x})
+	}
+}
+
+// HLine draws in logical coordinates and updates the rotated destination.
+func (d *FBDisplayController) HLine(x0, x1, y int, color uint16) {
+	if y < 0 || y >= d.h {
+		return
+	}
+	x0, x1 = max(0, x0), min(d.w-1, x1)
+	if x0 > x1 {
+		return
+	}
+	d.frame.HLine(x0, x1, y, color)
+	if d.surfaceReady && !d.surfaceSync {
+		d.paintPhysical(damage{y, y, x0, x1})
+		d.surfaceTouched = d.surfaceTouched.union(damage{y, y, x0, x1})
+	}
+}
+
+// Clear clears logical pixels; the finished frame is rotated once at Update.
+func (d *FBDisplayController) Clear(color uint16) {
+	d.frame.Clear(color)
+	d.surfaceSync = true
+}
+
+// Buffer exposes the logical RGB565 data and enables raw-write reconciliation.
+func (d *FBDisplayController) Buffer() []uint16 {
+	d.rawAccess = true
+	return d.frame.Buffer()
+}
+
+// SetBuffer replaces logical pixels and invalidates the rotated surface.
+func (d *FBDisplayController) SetBuffer(b []uint16) {
+	d.frame.SetBuffer(b)
+	d.rawAccess = true
+	d.surfaceSync = true
+}
+
+// MarkDirtyRect marks raw writes so the rotated surface is synchronized.
+func (d *FBDisplayController) MarkDirtyRect(x0, y0, x1, y1 int) {
+	d.frame.MarkDirtyRect(x0, y0, x1, y1)
+	d.surfaceSync = true
+}
+
+// copyPhysical copies only changed physical pixels to the inactive page.
+// No source-coordinate mapping, rotation or division runs in this hot path.
+func (d *FBDisplayController) copyPhysical(page int, dm damage) {
+	if dm.empty() {
+		return
+	}
+	base := page * d.yres * d.stride
+	for y := dm.r0; y <= dm.r1; y++ {
+		from := y*d.xres + dm.c0
+		to := base + y*d.stride + dm.c0
+		copy(d.pix[to:to+dm.c1-dm.c0+1], d.surface[from:from+dm.c1-dm.c0+1])
+	}
+}
+
+// Update copies changed physical pixels and pans to the completed page.
+// It keeps both framebuffer pages coherent across incremental updates.
 func (d *FBDisplayController) Update() error {
 	if d.mem == nil || len(d.buf) == 0 {
 		return nil
 	}
-
-	var wait time.Duration
-	t := time.Now()
-
+	start := time.Now()
 	dm := d.changed(d.check)
-	if d.check {
-		if dm.empty() {
-			d.lastCopy = time.Since(t)
-			d.skipped++
-			return nil
-		}
+	if d.rawAccess && d.surfaceReady {
+		d.surfaceSync = true
 	}
-	d.pend[0] = d.pend[0].union(dm)
-	d.pend[1] = d.pend[1].union(dm)
-	// Each selected page must receive a complete first frame.
+	d.syncSurface(dm)
+	if d.check && dm.empty() {
+		d.lastCopy = time.Since(start)
+		d.skipped++
+		return nil
+	}
+	changed := d.physicalDamage(dm)
+	if changed.empty() && d.pagePrimed[0] && d.pagePrimed[1] {
+		d.lastCopy = time.Since(start)
+		d.skipped++
+		return nil
+	}
+	d.pend[0] = d.pend[0].union(changed)
+	d.pend[1] = d.pend[1].union(changed)
+	copyArea := d.pend[d.back]
 	if !d.pagePrimed[d.back] {
-		d.pend[d.back] = d.fullDamage()
+		copyArea = damage{0, d.yres - 1, 0, d.xres - 1}
 	}
-
-	if d.pages == 1 && d.vsyncActive {
-		w := time.Now()
-		d.waitVSync()
-		wait = time.Since(w)
-	}
-	d.blit(d.pageIDs[d.back], d.pend[d.back])
+	d.copyPhysical(d.pageIDs[d.back], copyArea)
 	d.pagePrimed[d.back] = true
 	d.pend[d.back] = noDamage
-
-	d.lastCopy = time.Since(t) - wait
-	d.lastWait = wait
-
-	t = time.Now()
+	d.lastCopy = time.Since(start)
+	d.lastWait = 0
+	panStart := time.Now()
 	d.vinfo.Xoffset = 0
 	d.vinfo.Yoffset = uint32(d.pageIDs[d.back] * d.yres)
 	if err := fbIoctl(d.fd, fbioPanDisplay, unsafe.Pointer(&d.vinfo)); err != nil {
 		return fmt.Errorf("FBIOPAN_DISPLAY: %w", err)
 	}
-	if d.pages == 2 {
-		d.back ^= 1
-		if d.vsyncActive {
-			w := time.Now()
-			d.waitVSync()
-			d.lastWait = time.Since(w)
-		}
+	d.lastPage = d.pageIDs[d.back]
+	d.panChanged = true
+	d.back ^= 1
+	if d.vsyncActive {
+		w := time.Now()
+		d.waitVSync()
+		d.lastWait = time.Since(w)
 	}
-	d.lastShow = time.Since(t)
+	d.lastShow = time.Since(panStart)
 	return nil
 }
 
@@ -377,74 +602,50 @@ func (d *FBDisplayController) waitVSync() {
 	_ = fbIoctl(d.fd, fbioWaitForVSync, unsafe.Pointer(&zero))
 }
 
-// initCenteredMaps maps panel pixels to the active rectangle once.
-// Invalid coordinates use -1 so background pixels are never sampled.
-func (d *FBDisplayController) initCenteredMaps() {
-	p := d.presentation
-	d.xmap = make([]int32, d.xres)
-	d.ystart = make([]int32, d.yres)
-	d.srcX = make([]int32, d.xres)
-	d.srcY = make([]int32, d.yres)
-
-	for x := 0; x < d.xres; x++ {
-		var coordinate, offset, extent int
-		if d.rot == 90 || d.rot == 270 {
-			coordinate = x * p.height / d.xres
-			if d.rot == 90 {
-				coordinate = p.height - 1 - coordinate
-			}
-			offset, extent = p.y, d.h
-		} else {
-			coordinate = x * p.width / d.xres
-			if d.rot == 180 {
-				coordinate = p.width - 1 - coordinate
-			}
-			offset, extent = p.x, d.w
-		}
-		index := coordinate - offset
-		if index < 0 || index >= extent {
-			d.srcX[x], d.xmap[x] = -1, -1
-			continue
-		}
-		d.srcX[x] = int32(index)
-		if d.rot == 90 || d.rot == 270 {
-			d.xmap[x] = int32(index * d.w)
-		} else {
-			d.xmap[x] = int32(index)
-		}
+// blit is retained as the reference pixel mapper for regression tests.
+// Production Update uses the pre-rotated operation surface above.
+func (d *FBDisplayController) blit(page int, dm damage) {
+	if dm.empty() {
+		return
 	}
-
-	for y := 0; y < d.yres; y++ {
-		var coordinate, offset, extent int
-		if d.rot == 90 || d.rot == 270 {
-			coordinate = y * p.width / d.yres
-			if d.rot == 270 {
-				coordinate = p.width - 1 - coordinate
-			}
-			offset, extent = p.x, d.w
-		} else {
-			coordinate = y * p.height / d.yres
-			if d.rot == 180 {
-				coordinate = p.height - 1 - coordinate
-			}
-			offset, extent = p.y, d.h
+	if d.presentation.centered && !d.pagePrimed[d.back] {
+		d.fillCenteredBackground(page)
+	}
+	base := page * d.yres * d.stride
+	p := d.presentation
+	if p.centered && !p.scaled && d.rot == 0 && p.width == d.xres && p.height == d.yres {
+		for y := dm.r0; y <= dm.r1; y++ {
+			src := y*d.w + dm.c0
+			dst := base + (p.y+y)*d.stride + p.x + dm.c0
+			copy(d.pix[dst:dst+dm.c1-dm.c0+1], d.buf[src:src+dm.c1-dm.c0+1])
 		}
-		index := coordinate - offset
-		if index < 0 || index >= extent {
-			d.srcY[y], d.ystart[y] = -1, -1
+		return
+	}
+	// Compare on the same mapped pixels used by the operation surface.
+	for y := 0; y < d.yres; y++ {
+		sy := d.srcY[y]
+		if sy < 0 {
 			continue
 		}
-		d.srcY[y] = int32(index)
-		if d.rot == 90 || d.rot == 270 {
-			d.ystart[y] = int32(index)
-		} else {
-			d.ystart[y] = int32(index * d.w)
+		for x := 0; x < d.xres; x++ {
+			sx := d.srcX[x]
+			if sx < 0 {
+				continue
+			}
+			var dx, dy int
+			if d.rot == 90 || d.rot == 270 {
+				dx, dy = int(sy), int(sx)
+			} else {
+				dx, dy = int(sx), int(sy)
+			}
+			if dx < dm.c0 || dx > dm.c1 || dy < dm.r0 || dy > dm.r1 {
+				continue
+			}
+			d.pix[base+y*d.stride+x] = d.buf[d.xmap[x]+d.ystart[y]]
 		}
 	}
 }
 
-// fillCenteredBackground initializes one output page's margins.
-// Subsequent frames only touch pixels in the changed rectangle.
 func (d *FBDisplayController) fillCenteredBackground(page int) {
 	fillPixels(d.row[:d.xres], d.presentation.color)
 	base := page * d.yres * d.stride
@@ -454,74 +655,10 @@ func (d *FBDisplayController) fillCenteredBackground(page int) {
 	}
 }
 
-// blit copies changed pixels into the inactive framebuffer page.
-// Precomputed coordinate maps keep division out of the render loop.
-func (d *FBDisplayController) blit(page int, dm damage) {
-	if dm.empty() {
-		return
-	}
-	if d.presentation.centered && !d.pagePrimed[d.back] {
-		d.fillCenteredBackground(page)
-	}
-	base := page * d.yres * d.stride
-
-	if d.rot == 0 && d.w == d.xres && d.h == d.yres && d.stride == d.xres &&
-		dm.r0 == 0 && dm.r1 == d.h-1 && dm.c0 == 0 && dm.c1 == d.w-1 {
-		copy(d.pix[base:base+d.xres*d.yres], d.buf)
-		return
-	}
-
-	// A native, nonrotated centered rectangle can copy source rows directly.
-	p := d.presentation
-	if p.centered && d.rot == 0 && p.width == d.xres && p.height == d.yres {
-		n := dm.c1 - dm.c0 + 1
-		for y := dm.r0; y <= dm.r1; y++ {
-			src := y*d.w + dm.c0
-			dst := base + (p.y+y)*d.stride + p.x + dm.c0
-			copy(d.pix[dst:dst+n], d.buf[src:src+n])
-		}
-		return
-	}
-
-	// Rotated output columns map to source rows; otherwise to columns.
-	xlo, xhi, ylo, yhi := dm.c0, dm.c1, dm.r0, dm.r1
-	if d.rot == 90 || d.rot == 270 {
-		xlo, xhi, ylo, yhi = dm.r0, dm.r1, dm.c0, dm.c1
-	}
-
-	x0, x1 := d.xres, -1
-	for x, s := range d.srcX {
-		if int(s) >= xlo && int(s) <= xhi {
-			x0 = min(x0, x)
-			x1 = x
-		}
-	}
-	if x1 < 0 {
-		return
-	}
-
-	buf, xmap, row := d.buf, d.xmap, d.row
-	prev := int32(-1)
-	for y, start := range d.ystart {
-		if s := int(d.srcY[y]); s < ylo || s > yhi {
-			continue
-		}
-		if start != prev {
-			prev = start
-			for x := x0; x <= x1; x++ {
-				row[x] = buf[xmap[x]+start]
-			}
-		}
-		o := base + y*d.stride
-		copy(d.pix[o+x0:o+x1+1], row[x0:x1+1])
-	}
-}
-
 // Stats returns the active configuration and the latest timings.
 func (d *FBDisplayController) Stats() Stats {
 	return Stats{
 		Backend:     "fb",
-		Downscale:   d.downscale,
 		VSyncActive: d.vsyncActive,
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,
@@ -531,10 +668,29 @@ func (d *FBDisplayController) Stats() Stats {
 }
 
 // Close unmaps the framebuffer and closes the device. Calling it twice is safe.
+// DebugInfo describes the framebuffer geometry and software rotation.
+func (d *FBDisplayController) DebugInfo() string {
+	p := d.presentation
+	return fmt.Sprintf("FB physical=%dx%d virtual=%dx%d stride=%d rotate=%d (%s) canvas=%dx%d viewport=(%d,%d)+%dx%d mode=%s pages=%v renderer=rotated-operations",
+		d.xres, d.yres, d.vinfo.XresVirtual, d.vinfo.YresVirtual, d.stride,
+		d.rot, d.rotSource, p.width, p.height, p.x, p.y, p.activeW, p.activeH,
+		p.mode, d.pageIDs)
+}
+
+// Close releases /dev/fb0 and restores the initial pan when still owned.
 func (d *FBDisplayController) Close() {
+	if d.fd >= 0 && d.panChanged {
+		var current fbVarScreeninfo
+		if err := fbIoctl(d.fd, fbioGetVScreenInfo, unsafe.Pointer(&current)); err == nil &&
+			current.Xres == d.originalVInfo.Xres && current.Yres == d.originalVInfo.Yres &&
+			current.Xoffset == 0 && current.Yoffset == uint32(d.lastPage*d.yres) {
+			original := d.originalVInfo
+			_ = fbIoctl(d.fd, fbioPanDisplay, unsafe.Pointer(&original))
+		}
+	}
 	if d.mem != nil {
 		_ = syscall.Munmap(d.mem)
-		d.mem, d.pix, d.buf = nil, nil, nil
+		d.mem, d.pix, d.buf, d.surface = nil, nil, nil, nil
 	}
 	if d.fd > 0 {
 		_ = syscall.Close(d.fd)

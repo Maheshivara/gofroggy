@@ -45,7 +45,7 @@ func logMsg(msg string) {
 }
 
 func run() error {
-	disp, err := display.NewDisplayController(display.Config{Downscale: 1})
+	disp, err := display.NewDisplayController(display.Config{})
 	if err != nil {
 		return err
 	}

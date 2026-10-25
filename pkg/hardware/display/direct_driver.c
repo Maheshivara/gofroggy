@@ -46,6 +46,11 @@ int dd_load(const char *path) {
   g_update = (fn_update)dlsym(g_handle, "video_driver_update_screen");
   if (!g_disp) {
     snprintf(g_err, sizeof g_err, "driver has no video_driver_disp_frame");
+    dlclose(g_handle);
+    g_handle = NULL;
+    g_init = NULL;
+    g_disp = NULL;
+    g_update = NULL;
     return DD_ERR_NO_DISP;
   }
   return DD_OK;
@@ -55,11 +60,20 @@ const char *dd_error(void) { return g_err[0] ? g_err : "unknown error"; }
 
 int dd_init(void) { return g_init ? g_init() : 1; }
 
-void dd_show(void *buf, int w, int h, int pitch, int update_screen) {
+void dd_present(void *buf, int w, int h, int pitch) {
   if (g_disp)
     g_disp(buf, w, h, pitch);
-  if (update_screen && g_update)
+}
+
+void dd_update(void) {
+  if (g_update)
     g_update();
+}
+
+void dd_show(void *buf, int w, int h, int pitch, int update_screen) {
+  dd_present(buf, w, h, pitch);
+  if (update_screen)
+    dd_update();
 }
 
 void dd_unload(void) {
@@ -67,6 +81,9 @@ void dd_unload(void) {
     dlclose(g_handle);
     g_handle = NULL;
   }
+  g_init = NULL;
+  g_disp = NULL;
+  g_update = NULL;
 }
 
 int dd_fb_open(int *panel_w, int *panel_h) {

@@ -32,7 +32,6 @@ func init() {
 type DirectDisplayController struct {
 	frame
 
-	downscale        float64 // effective factor: panel width / render width
 	vsyncActive      bool
 	updateScreen     bool
 	frameSize        int
@@ -52,11 +51,19 @@ type DirectDisplayController struct {
 	quit    chan struct{}     // closed when the driver thread has exited
 
 	lastCopy, lastWait, lastShow time.Duration
+	lastDetail                   DirectTimings
 }
 
 // directTiming is the timing of one presented frame.
 type directTiming struct {
-	wait, show time.Duration
+	wait, show, update time.Duration
+}
+
+// DirectTimings separates frame comparison, staging and vendor calls.
+// PipelineWait is time spent waiting to reuse a staging buffer.
+type DirectTimings struct {
+	Compare, PipelineWait, StageCopy   time.Duration
+	VSync, DriverDisplay, DriverUpdate time.Duration
 }
 
 var _ DisplayController = (*DirectDisplayController)(nil)
@@ -83,7 +90,6 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 	}
 
 	d := &DirectDisplayController{
-		downscale:    float64(panelW) / float64(baseFrame.w),
 		vsyncActive:  vsyncOK,
 		updateScreen: cfg.UpdateScreen,
 		frameSize:    frameSize,
@@ -129,13 +135,18 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 			fmt.Fprintf(os.Stderr, "display: video_drivers_init returned %d\n", int(ret))
 		}
 
+		defer C.dd_unload()
 		var stage [2]unsafe.Pointer
+		defer func() {
+			for _, ptr := range stage {
+				if ptr != nil {
+					C.dd_free(ptr)
+				}
+			}
+		}()
 		for i := range stage {
 			p := C.dd_alloc(C.size_t(frameSize))
 			if p == nil {
-				for j := 0; j < i; j++ {
-					C.dd_free(stage[j])
-				}
 				ready <- fmt.Errorf("cannot allocate staging buffer %d", i)
 				return
 			}
@@ -152,14 +163,15 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 				tm.wait = time.Since(t)
 			}
 			t := time.Now()
-			C.dd_show(stage[idx], C.int(outputW), C.int(outputH), pitch, update)
+			C.dd_present(stage[idx], C.int(outputW), C.int(outputH), pitch)
 			tm.show = time.Since(t)
+			if update != 0 {
+				t = time.Now()
+				C.dd_update()
+				tm.update = time.Since(t)
+			}
 			d.done <- tm
 		}
-
-		C.dd_free(stage[0])
-		C.dd_free(stage[1])
-		C.dd_unload()
 	}()
 
 	if err := <-ready; err != nil {
@@ -176,44 +188,81 @@ func (d *DirectDisplayController) Update() error {
 		return nil
 	}
 
-	// Compare before waiting for the preceding frame.
+	// The driver owns a staging buffer until it completes the vendor call.
+	// Compare first to overlap CPU work with the previous presentation.
 	t := time.Now()
 	dm := d.changed(d.check)
-	if dm.empty() {
-		d.lastCopy = time.Since(t)
+	compareTime := time.Since(t)
+	if d.check && dm.empty() {
+		d.lastDetail.Compare = compareTime
+		d.lastDetail.PipelineWait = 0
+		d.lastDetail.StageCopy = 0
+		d.lastCopy = compareTime
 		d.skipped++
 		return nil
 	}
-	compareTime := time.Since(t)
+
+	var pipelineWait time.Duration
 	if d.pending {
+		t = time.Now()
 		tm := <-d.done
-		d.lastWait, d.lastShow = tm.wait, tm.show
+		pipelineWait = time.Since(t)
+		d.lastWait, d.lastShow = tm.wait, tm.show+tm.update
+		d.lastDetail.VSync = tm.wait
+		d.lastDetail.DriverDisplay = tm.show
+		d.lastDetail.DriverUpdate = tm.update
 		d.pending = false
 	}
+
 	i := d.next
 	d.next ^= 1
 	d.pend[0] = d.pend[0].union(dm)
 	d.pend[1] = d.pend[1].union(dm)
 	rows := d.pend[i]
-	d.pend[i] = noDamage
-	t = time.Now()
-	dst := unsafe.Slice((*uint16)(d.stage[i]), d.outputW*d.outputH)
-	if _, err := d.presentation.compose(dst, d.buf, d.w, d.h, rows, !d.stagePrimed[i]); err != nil {
-		return err
+	if !d.stagePrimed[i] {
+		rows = d.fullDamage()
 	}
+
+	t = time.Now()
+	if d.presentation.native(d.w, d.h) {
+		// One libc memcpy for a contiguous span; include complete rows so the
+		// staging copy needs no per-row Go loop or multiple cgo transitions.
+		if !rows.empty() {
+			start := rows.r0 * d.w
+			n := (rows.r1 - rows.r0 + 1) * d.w
+			C.dd_copy(unsafe.Add(d.stage[i], uintptr(start*2)),
+				unsafe.Pointer(&d.buf[start]), C.size_t(n*2))
+			runtime.KeepAlive(d.buf)
+		}
+	} else {
+		dst := unsafe.Slice((*uint16)(d.stage[i]), d.outputW*d.outputH)
+		if _, err := d.presentation.compose(dst, d.buf, d.w, d.h, rows, !d.stagePrimed[i]); err != nil {
+			return err
+		}
+	}
+	stageTime := time.Since(t)
 	d.stagePrimed[i] = true
-	d.lastCopy = compareTime + time.Since(t)
+	d.pend[i] = noDamage
+	d.lastCopy = compareTime + stageTime
+	d.lastDetail.Compare = compareTime
+	d.lastDetail.PipelineWait = pipelineWait
+	d.lastDetail.StageCopy = stageTime
 
 	d.req <- i
 	d.pending = true
 	return nil
 }
 
+// Timings returns the latest Direct frame's individual costs.
+// Vendor-call values describe the last completed presentation.
+func (d *DirectDisplayController) Timings() DirectTimings {
+	return d.lastDetail
+}
+
 // Stats returns the active configuration and the latest timings.
 func (d *DirectDisplayController) Stats() Stats {
 	return Stats{
 		Backend:     "direct",
-		Downscale:   d.downscale,
 		VSyncActive: d.vsyncActive,
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,

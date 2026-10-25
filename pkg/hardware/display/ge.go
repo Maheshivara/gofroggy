@@ -4,7 +4,7 @@ package display
 
 // Pure-Go SF3000 /dev/ge backend. This is a hardware-specific implementation:
 // the 232-byte HCGE instruction sequence was captured from the vendor driver
-// and successfully executed in the SF3000 v4-v7 hardware experiments.
+// and successfully executed in the SF3000 device.
 //
 // It is NOT a generic HCGE implementation. Do not use with another framebuffer
 // layout, another rotation, or simultaneously with another display client.
@@ -47,11 +47,11 @@ type GEDisplayController struct {
 	check                             bool
 	vsync                             bool
 	vsyncActive                       bool
-	downscale                         float64
-	lastCopy, lastWait, lastShow      time.Duration
-	skipped                           uint64
-	closed, faulty                    bool
-	sourcePrimed                      bool
+
+	lastCopy, lastWait, lastShow time.Duration
+	skipped                      uint64
+	closed, faulty               bool
+	sourcePrimed                 bool
 }
 
 var _ DisplayController = (*GEDisplayController)(nil)
@@ -91,7 +91,7 @@ func geCacheFlush(b []byte) error {
 }
 
 // NewGEDisplayController opens the SF3000 GE without cgo or vendor libraries.
-// Explicitly smaller buffers are centered before hardware rotation.
+// Presentation scales or centers the image before hardware rotation.
 func NewGEDisplayController(cfg Config) (d *GEDisplayController, err error) {
 	if cfg.Rotation != RotationNone && cfg.Rotation != RotationC90 {
 		return nil, fmt.Errorf("SF3000 GE supports only its established 90-degree clockwise path, got %s", cfg.Rotation)
@@ -177,7 +177,6 @@ func NewGEDisplayController(cfg Config) (d *GEDisplayController, err error) {
 	if e := d.frame.configure(cfg, gePanelWidth, gePanelHeight); e != nil {
 		return nil, e
 	}
-	d.downscale = float64(gePanelWidth) / float64(d.w)
 
 	d.gefd, err = syscall.Open("/dev/ge", syscall.O_RDWR, 0)
 	if err != nil {
@@ -219,11 +218,7 @@ func NewGEDisplayController(cfg Config) (d *GEDisplayController, err error) {
 	for i, page := range d.backupPages {
 		d.backups[i] = append([]byte(nil), d.page(page)...)
 	}
-	// The synthetic 50.96-FPS GE benchmark rendered straight into this
-	// framebuffer-backed source page. Avoid uploading the entire 854x480
-	// frame from a Go heap buffer on every Update (10-55 ms on device).
-	// This is safe because submit waits for every GE command to finish before
-	// returning, and source/scratch/display pages never overlap.
+
 	if d.presentation.native(d.w, d.h) {
 		src := d.page(d.srcPage)
 		d.frame.buf = unsafe.Slice((*uint16)(unsafe.Pointer(&src[0])), gePanelWidth*gePanelHeight)
@@ -379,8 +374,7 @@ func (d *GEDisplayController) submit(dst uint32) (flushTime, waitTime time.Durat
 	}
 	flushTime = time.Since(t)
 	end := cursor + uint32(len(packet))
-	// Exact hcge_feed_nodes transition observed in the vendor code and used
-	// successfully by the v7 benchmark. Direct 32-bit MMIO stores only.
+	// Exact hcge_feed_nodes transition observed in the vendor code
 	geMMIOWrite32(d.regs, 0x10, cursor)
 	geMMIOWrite32(d.regs, 0x14, end-4)
 	geMMIOWrite32(d.ring, 0x10, 0)
@@ -460,9 +454,31 @@ func (d *GEDisplayController) Update() error {
 	return nil
 }
 
+// DebugInfo returns read-only GE queue, framebuffer and sample-pixel state.
+// It does not reset, submit, or otherwise modify the graphics engine.
+func (d *GEDisplayController) DebugInfo() string {
+	if d.closed || len(d.ring) == 0 || len(d.regs) == 0 || len(d.fb) == 0 {
+		return "GE closed or not initialized"
+	}
+	fbState := "ok"
+	if err := d.expectDisplayedPage(d.visiblePage); err != nil {
+		fbState = err.Error()
+	}
+	page := d.page(d.visiblePage)
+	pixel := func(x, y int) uint16 {
+		off := (y*gePanelWidth + x) * 2
+		return uint16(page[off]) | uint16(page[off+1])<<8
+	}
+	return fmt.Sprintf("GE visible=%d original=%d src=%d tmp=%d out=%v queue=%08x hwcursor=%08x hwstatus=%08x ctrl=%08x pan=%s pixels[top-left,center,bottom-right]=[%04x,%04x,%04x] faulty=%v",
+		d.visiblePage, d.originalPage, d.srcPage, d.tmpPage, d.outputPages,
+		geGet(d.ring, 0x18), geMMIORead32(d.regs, 0x10), geMMIORead32(d.regs, 8),
+		geMMIORead32(d.regs, 0), fbState,
+		pixel(0, 0), pixel(gePanelWidth/2, gePanelHeight/2), pixel(gePanelWidth-1, gePanelHeight-1), d.faulty)
+}
+
 // Stats implements DisplayController. Timings refer to the latest Update.
 func (d *GEDisplayController) Stats() Stats {
-	return Stats{Backend: "ge", Downscale: d.downscale, VSyncActive: d.vsyncActive,
+	return Stats{Backend: "ge", VSyncActive: d.vsyncActive,
 		Copy: d.lastCopy, Wait: d.lastWait, Show: d.lastShow, Skipped: d.skipped}
 }
 

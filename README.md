@@ -57,7 +57,6 @@ import (
 func main() {
 	disp, err := display.NewDisplayController(display.Config{
 		Backend:   display.BackendBridge,
-		Downscale: 1.9, // renders 448x252; the driver stretches it to 854x480
 	})
 	if err != nil {
 		panic(err)
@@ -105,7 +104,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=mipsle go build -o app .
 $GCC -O2 -o driver_bridge driver_bridge.c -ldl
 ```
 
-Copy `app` and `driver_bridge` to the device (next to `driver_sf3000.so`, or into `/mnt/sdcard/cubegm`) and run `app` while TreeFrogUI is running (as currently TreeFrogUI doesn't have a sideloading option, you will have to overwrite some of the existent standalone, **I** recommend that you rename of `image_viewer` to `image_viewer.bkp` and put the app with the name `image_viewer`).
+Copy `driver_bridge` to `/mnt/sdcard/cubegm` on the device (next to `driver_sf3000.so`) and configure `app` on ports following the instructions on https://github.com/tzubertowski/TreeFrogUI_PortsCollection#for-port-developers .
 
 To use the direct backend instead, build with `CGO_ENABLED=1` and the toolchain's gcc as `CC`, and set `Backend: display.BackendDirect`.
 
@@ -138,13 +137,14 @@ The `fb` display controller try to get the display rotation from the hcge config
 
 ### Performance notes
 
-Measured on one SF3000 with continuous presentation (FPS example), no vSync and no `update_screen`:
+Measured on one SF3000 with continuous presentation (FPS example), no vSync, no `update_screen` and with 854x480 screen:
 
-| Driver controller | Downscale | FPS |
-| ----------------- | --------- | --- |
-| fb                | 1         | ~40 |
-| bridge            | 1         | ~25 |
-| direct            | 1         | ~40 |
+| Driver controller | FPS |
+| ----------------- | --- |
+| fb                | ~35 |
+| bridge            | ~25 |
+| direct            | ~30 |
+| ge                | ~25 |
 
 > [!TIP]
 > If you are experiencing tearing at high sizes, it go away with vSync and update_screen (performance wise vSync is better), but expect a FPS drop.
@@ -154,6 +154,7 @@ Tips:
 - The `Update()` ignores frames that doesn't changed, but it comes with a cost of the comparison, if your app changes the frames constantly, disabling it (by the `DisableFrameCheck` config option) can improve the performance.
 - Choose the render size once at startup. Changing it while running can make the driver misbehave (thanks for the contributors of [hwdisp.c](https://github.com/tzubertowski/TreeFrogUI_picoarch/blob/2331945330b7881f80790fdc0bd089bb117a185c/hwdisp.c) that tested and did the hard work).
 - Write with `SetBuffer()` directly for heavy drawing; calling `SetPixel` for every pixel is slow.
+- GE driver controller has a better display result than the FB one, but it appears to be a bit unstable
 
 ## Drawing and text
 

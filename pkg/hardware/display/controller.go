@@ -5,7 +5,6 @@ package display
 import (
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"syscall"
 	"time"
@@ -68,9 +67,6 @@ type DisplayController interface {
 type Stats struct {
 	// Backend identifies "direct", "bridge", "fb", or "ge".
 	Backend string
-
-	// Downscale is panel width divided by render width.
-	Downscale float64
 
 	// VSyncActive reports whether the vsync wait works.
 	VSyncActive bool
@@ -142,46 +138,83 @@ func ParseBackend(s string) (Backend, error) {
 	return BackendAuto, fmt.Errorf("unknown display backend %q (want auto, bridge, direct, fb or ge)", s)
 }
 
+// ScalingMode chooses how render pixels occupy the physical display.
+type ScalingMode uint8
+
+const (
+	// ScalingCenter places pixels at native size with colored surrounding bars.
+	ScalingCenter ScalingMode = iota
+	// ScalingStretch resamples the image to cover the entire display.
+	ScalingStretch
+
+	// ScalingFit maximizes the image while preserving its aspect ratio.
+	// Remaining space uses BackgroundColor.
+	ScalingFit
+)
+
+// String returns the scaling mode's name.
+func (m ScalingMode) String() string {
+	switch m {
+	case ScalingCenter:
+		return "center"
+	case ScalingStretch:
+		return "stretch"
+	case ScalingFit:
+		return "fit"
+	default:
+		return fmt.Sprintf("unknown(%d)", m)
+	}
+}
+
+// ParseScalingMode parses "center", "stretch" and "fit".
+// "contain" is an alias for "fit".
+func ParseScalingMode(s string) (ScalingMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "center", "fill":
+		return ScalingCenter, nil
+	case "stretch":
+		return ScalingStretch, nil
+	case "fit", "contain", "letterbox":
+		return ScalingFit, nil
+	default:
+		return 0, fmt.Errorf("unknown scaling mode %q (want center, fit or stretch)", s)
+	}
+}
+
 // Config controls how the display is driven. The zero value is valid.
 type Config struct {
-	// BackgroundColor is the RGB565 color outside an explicitly smaller image.
-	// The default is black (0x0000).
-	BackgroundColor uint16
-
-	// Width and Height select the render size, overriding Downscale.
-	// Smaller explicit sizes are centered without scaling.
+	// Width and Height set the RGB565 drawing resolution; zero uses panel size.
 	Width, Height int
 
-	// Downscale divides the panel size (fractional is fine, e.g. 1.9).
-	// 0 or 1 is native size.
-	Downscale float64
+	// Scaling selects native centering, aspect-preserving fit or stretching.
+	Scaling ScalingMode
 
-	// VSync waits for the vertical blank before each frame: no tearing, but
-	// about 30 fps.
+	// BackgroundColor colors Center/Fit bars; zero means black.
+	BackgroundColor uint16
+
+	// VSync requests hardware vertical synchronization when supported.
 	VSync bool
 
-	// DriverPath is the driver library to load. Empty searches ./driver_sf3000.so,
-	// then /mnt/sdcard/cubegm/driver_sf3000.so.
+	// DriverPath overrides the vendor driver library location.
 	DriverPath string
 
-	// BridgePath is the driver bridge path. Empty searches ./driver_bridge,
-	// then /mnt/sdcard/cubegm/driver_bridge.
+	// BridgePath overrides the driver_bridge helper executable location.
 	BridgePath string
 
-	// UpdateScreen also calls the driver's update_screen: about 20 fps, so
-	// it is off by default.
+	// UpdateScreen calls the optional vendor update-screen function.
 	UpdateScreen bool
 
-	// Backend picks the implementation (default BackendAuto).
+	// Backend selects the implementation (zero uses BackendAuto).
 	Backend Backend
 
-	// DisableFrameCheck turns off the comparison with the previous frame.
-	// By default a frame identical to the last one is not shown again, and
-	// only what changed is copied.
+	// TrackDrawDamage tracks helper writes; Clear and raw Buffer writes
+	// use final-frame comparison so unchanged pixels are not resent.
+	TrackDrawDamage bool
+
+	// DisableFrameCheck presents frames even when pixels have not changed.
 	DisableFrameCheck bool
 
-	// Rotation overrides detected rotation for FB; GE supports none/c90.
-	// Bridge and Direct leave rotation to the vendor driver.
+	// Rotation overrides FB rotation; Direct and Bridge use the vendor driver.
 	Rotation Rotation
 }
 
@@ -200,11 +233,16 @@ const (
 
 	// RotationC270 rotates 270 degrees clockwise.
 	RotationC270
+
+	// RotationC0 forces no software rotation (unlike RotationNone, which detects).
+	RotationC0
 )
 
-// String returns "none", "c90", "c180" or "c270".
+// String returns the requested clockwise rotation or "none" for detection.
 func (r Rotation) String() string {
 	switch r {
+	case RotationC0:
+		return "c0"
 	case RotationC90:
 		return "c90"
 	case RotationC180:
@@ -230,11 +268,13 @@ func (r Rotation) Degrees() int {
 	}
 }
 
-// ParseRotation parses "none", "c90", "c180" or "c270" (also "90", "180", "270").
+// ParseRotation accepts automatic detection or an explicit clockwise rotation.
 func ParseRotation(s string) (Rotation, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "none":
+	case "", "none", "auto":
 		return RotationNone, nil
+	case "c0", "0":
+		return RotationC0, nil
 	case "c90", "90":
 		return RotationC90, nil
 	case "c180", "180":
@@ -242,7 +282,7 @@ func ParseRotation(s string) (Rotation, error) {
 	case "c270", "270":
 		return RotationC270, nil
 	}
-	return RotationNone, fmt.Errorf("unknown rotation %q (want none, c90, c180 or c270)", s)
+	return RotationNone, fmt.Errorf("unknown rotation %q (want none, c0, c90, c180 or c270)", s)
 }
 
 // ErrCGODisabled means BackendDirect was requested in a build without cgo.
@@ -290,35 +330,28 @@ func NewDisplayController(cfg Config) (DisplayController, error) {
 	return NewFBDisplayController(cfg)
 }
 
-// resolveSize returns the even render size for cfg (Width x Height, or the
-// panel size divided by Downscale).
+// resolveSize validates the app's drawing resolution for the device.
 func resolveSize(cfg Config, panelW, panelH int) (w, h int, err error) {
-	if cfg.Width > 0 && cfg.Height > 0 {
-		w, h = cfg.Width, cfg.Height
+	if cfg.Scaling != ScalingCenter && cfg.Scaling != ScalingStretch && cfg.Scaling != ScalingFit {
+		return 0, 0, fmt.Errorf("invalid scaling mode %d", cfg.Scaling)
+	}
+	if (cfg.Width == 0) != (cfg.Height == 0) {
+		return 0, 0, fmt.Errorf("Width and Height must both be set or both zero")
+	}
+	if cfg.Width == 0 && cfg.Height == 0 {
+		w, h = panelW, panelH
 	} else {
-		f := cfg.Downscale
-		if f == 0 {
-			f = 1
-		}
-		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-			return 0, 0, fmt.Errorf("invalid downscale factor %v", cfg.Downscale)
-		}
-		fw := math.Floor(float64(panelW) / f)
-		fh := math.Floor(float64(panelH) / f)
-		w, h = int(fw), int(fh)
+		w, h = cfg.Width, cfg.Height
 	}
-
-	// Even dimensions only: odd source widths wedge some driver builds.
-	w &^= 1
-	h &^= 1
-
-	if w < 2 || h < 2 {
-		return 0, 0, fmt.Errorf("render size %dx%d is too small", w, h)
+	if w < 2 || h < 2 || w > 4096 || h > 4096 || int64(w)*int64(h) > 4096*2048 {
+		return 0, 0, fmt.Errorf("invalid render size %dx%d (minimum 2x2; maximum 4096 per dimension and 8M pixels)", w, h)
 	}
-	if w > 1280 || h > 720 {
-		return 0, 0, fmt.Errorf("render size %dx%d is larger than 1280x720", w, h)
+	if w%2 != 0 || h%2 != 0 {
+		return 0, 0, fmt.Errorf("render dimensions must be even: got %dx%d", w, h)
 	}
-
+	if cfg.Scaling == ScalingCenter && (w > panelW || h > panelH) {
+		return 0, 0, fmt.Errorf("centered %dx%d image exceeds the %dx%d panel; use ScalingFit or ScalingStretch", w, h, panelW, panelH)
+	}
 	return w, h, nil
 }
 
