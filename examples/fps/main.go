@@ -193,7 +193,8 @@ func (app *Application) Run() {
 func main() {
 
 	cfg := display.Config{
-		Backend:         display.BackendGE,
+		Backend:         display.BackendAuto,
+		HideSystemOSD:   true,
 		TrackDrawDamage: true,
 	}
 

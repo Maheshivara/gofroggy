@@ -209,6 +209,10 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 		d.buf = d.sharedPixels
 	}
 
+	if err := d.configureOSD(cfg); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -283,6 +287,7 @@ func (d *BridgeDisplayController) Stats() Stats {
 
 // Close stops the bridge and unmaps the frame buffer. Calling it twice is safe.
 func (d *BridgeDisplayController) Close() {
+	defer d.closeOSD()
 	if d.stdinPipe != nil {
 		_ = d.stdinPipe.Close() // EOF makes the bridge shut down
 		d.stdinPipe = nil

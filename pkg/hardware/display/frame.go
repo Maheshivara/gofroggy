@@ -13,6 +13,7 @@ import (
 
 // frame is the frame buffer and drawing code shared by all backends.
 type frame struct {
+	osd          *osdLease
 	w, h         int // render size
 	lw, lh       int // logical size (configured size or panel size)
 	buf          []uint16

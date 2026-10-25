@@ -192,6 +192,10 @@ type Config struct {
 	// BackgroundColor colors Center/Fit bars; zero means black.
 	BackgroundColor uint16
 
+	// HideSystemOSD blanks /dev/fb1 while active, hiding battery and volume OSD.
+	// Its previous blank state is restored on Close; default is false.
+	HideSystemOSD bool
+
 	// VSync requests hardware vertical synchronization when supported.
 	VSync bool
 

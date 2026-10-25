@@ -178,6 +178,10 @@ func NewDirectDisplayController(cfg Config) (*DirectDisplayController, error) {
 		C.dd_fb_close()
 		return nil, err
 	}
+	if err := d.configureOSD(cfg); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -273,6 +277,7 @@ func (d *DirectDisplayController) Stats() Stats {
 
 // Close stops the driver thread and frees the buffers. Calling it twice is safe.
 func (d *DirectDisplayController) Close() {
+	defer d.closeOSD()
 	if d.req == nil {
 		return
 	}

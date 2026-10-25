@@ -278,6 +278,10 @@ func NewFBDisplayController(cfg Config) (*FBDisplayController, error) {
 	d.initMaps()
 	d.initOperationSurface()
 
+	if err := d.configureOSD(cfg); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -679,6 +683,7 @@ func (d *FBDisplayController) DebugInfo() string {
 
 // Close releases /dev/fb0 and restores the initial pan when still owned.
 func (d *FBDisplayController) Close() {
+	defer d.closeOSD()
 	if d.fd >= 0 && d.panChanged {
 		var current fbVarScreeninfo
 		if err := fbIoctl(d.fd, fbioGetVScreenInfo, unsafe.Pointer(&current)); err == nil &&
