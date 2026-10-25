@@ -24,6 +24,12 @@ int dd_init(void);
 // update_screen also calls the driver's update_screen.
 void dd_show(void *buf, int w, int h, int pitch, int update_screen);
 
+// dd_present calls only the vendor's frame-display function.
+void dd_present(void *buf, int w, int h, int pitch);
+
+// dd_update optionally calls the vendor's update-screen function.
+void dd_update(void);
+
 // dd_unload unloads the driver.
 void dd_unload(void);
 

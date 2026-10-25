@@ -11,17 +11,24 @@ import (
 	"unsafe"
 )
 
-// frame is the frame buffer and drawing code shared by both backends.
+// frame is the frame buffer and drawing code shared by all backends.
 type frame struct {
-	w, h   int // render size
-	lw, lh int // logical size (the panel size)
-	buf    []uint16
+	w, h         int // render size
+	lw, lh       int // logical size (configured size or panel size)
+	buf          []uint16
+	presentation presentation
 
 	prev   []uint16 // the frame as last compared (see framecheck.go)
 	primed bool     // prev holds a frame
+
+	trackDrawDamage bool // fast path for drawing-helper writes
+	exposed         bool // Buffer() or SetBuffer() may be modified externally
+	exposurePending bool // first raw-buffer comparison also needs earlier helper changes
+	forceCompare    bool // Clear requires checking final pixels, not intermediate writes
+	dirty           damage
 }
 
-// LogicalSize returns the panel size.
+// LogicalSize returns the configured logical size, or the panel size.
 func (f *frame) LogicalSize() (int, int) {
 	if f.lw <= 0 || f.lh <= 0 {
 		return f.w, f.h
@@ -44,13 +51,35 @@ func (f *frame) Width() int { return f.w }
 func (f *frame) Height() int { return f.h }
 
 // Buffer returns the frame buffer.
-func (f *frame) Buffer() []uint16 { return f.buf }
+func (f *frame) Buffer() []uint16 {
+	// A writable slice can change without calling our drawing helpers.
+	// Establish the previous image before returning the first such slice.
+	if f.trackDrawDamage && !f.exposed {
+		f.prev = append(f.prev[:0], f.buf...)
+		f.primed = true
+		f.exposed = true
+		f.exposurePending = true
+	}
+	return f.buf
+}
 
-// Set buffer directly
-func (f *frame) SetBuffer(b []uint16) { f.buf = b }
+// SetBuffer replaces the drawing buffer and invalidates its full contents.
+func (f *frame) SetBuffer(b []uint16) {
+	f.buf = b
+	f.dirty = f.fullDamage()
+	f.primed = false
+	f.exposed = true
+	f.exposurePending = false
+	f.forceCompare = true
+}
 
 // Clear fills the frame buffer with c.
 func (f *frame) Clear(c uint16) {
+	if f.trackDrawDamage {
+		// Clear followed by a redraw often leaves most pixels unchanged.
+		f.forceCompare = true
+	}
+	f.markDirty(f.fullDamage())
 	if c == 0 {
 		clear(f.buf)
 		return
@@ -75,7 +104,11 @@ func (f *frame) SetPixel(x, y int, c uint16) {
 	if x < 0 || x >= f.w || y < 0 || y >= f.h {
 		return
 	}
-	f.buf[y*f.w+x] = c
+	idx := y*f.w + x
+	if f.buf[idx] != c {
+		f.buf[idx] = c
+		f.markDirty(damage{y, y, x, x})
+	}
 }
 
 // GetPixel returns a pixel in render pixels.
@@ -96,6 +129,7 @@ func (f *frame) HLine(x0, x1, y int, color uint16) {
 		return
 	}
 	fillPixels(f.buf[y*f.w+x0:y*f.w+x1+1], color)
+	f.markDirty(damage{y, y, x0, x1})
 }
 
 // SaveScreenshot writes the frame buffer as a PNG.
@@ -200,9 +234,8 @@ func (f *frame) fullDamage() damage {
 	return damage{0, f.h - 1, 0, f.w - 1}
 }
 
-// diff compares buf with the previous frame, refreshes prev for what changed
-// and returns the bounding box of the changes (empty if there are none). The
-// first call counts as a full change, so the first frame is always shown.
+// diff returns the changed bounding box and updates the previous image.
+// The first comparison always reports a full frame.
 func (f *frame) diff() damage {
 	w, h := f.w, f.h
 
@@ -250,4 +283,23 @@ func (f *frame) diff() damage {
 		return noDamage
 	}
 	return damage{r0, r1, 2 * c0, 2*c1 + 1}
+}
+
+// MarkDirtyRect marks a changed inclusive rectangle for opt-in tracking.
+// Writes through Buffer() still trigger comparison for safety.
+func (f *frame) MarkDirtyRect(x0, y0, x1, y1 int) {
+	if f.w <= 0 || f.h <= 0 {
+		return
+	}
+	x0, x1 = max(0, x0), min(f.w-1, x1)
+	y0, y1 = max(0, y0), min(f.h-1, y1)
+	if x0 <= x1 && y0 <= y1 {
+		f.markDirty(damage{y0, y1, x0, x1})
+	}
+}
+
+func (f *frame) markDirty(d damage) {
+	if f.trackDrawDamage {
+		f.dirty = f.dirty.union(d)
+	}
 }

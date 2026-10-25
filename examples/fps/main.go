@@ -67,8 +67,8 @@ func (app *Application) Init(cfg display.Config) error {
 	app.Display = disp
 	st := disp.Stats()
 	lw, lh := disp.LogicalSize()
-	logMsg(fmt.Sprintf("Display: backend=%s render=%dx%d logical=%dx%d downscale=%.2f vsync requested=%v active=%v",
-		st.Backend, disp.Width(), disp.Height(), lw, lh, st.Downscale, cfg.VSync, st.VSyncActive))
+	logMsg(fmt.Sprintf("Display: backend=%s render=%dx%d logical=%dx%d vsync requested=%v active=%v",
+		st.Backend, disp.Width(), disp.Height(), lw, lh, cfg.VSync, st.VSyncActive))
 
 	logMsg("Init: Starting InputController initialization...")
 	inputCtrl, err := input.NewInputController(nil)
@@ -192,7 +192,10 @@ func (app *Application) Run() {
 
 func main() {
 
-	cfg := display.Config{Width: 0, Height: 0, Downscale: 1, VSync: false, UpdateScreen: false, Backend: display.BackendAuto}
+	cfg := display.Config{
+		Backend:         display.BackendGE,
+		TrackDrawDamage: true,
+	}
 
 	var err error
 	logFile, err = os.OpenFile("/mnt/sdcard/test.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)

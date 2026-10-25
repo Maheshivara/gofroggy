@@ -19,17 +19,18 @@ import (
 type BridgeDisplayController struct {
 	frame
 
-	downscale   float64 // effective factor: panel width / render width
 	vsyncActive bool
 
 	lastCopy, lastWait, lastShow time.Duration
 
-	check   bool   // compare frames, skipping or shrinking unchanged ones
-	skipped uint64 // frames skipped because they were identical
-	rowsOK  bool   // the bridge can copy just some rows ("R" command)
-	cur     int    // staging buffer the bridge fills next (it alternates)
-	pend    [2]damage
-	rowsCmd [5]byte
+	check        bool   // compare frames, skipping or shrinking unchanged ones
+	skipped      uint64 // frames skipped because they were identical
+	rowsOK       bool   // the bridge can copy just some rows ("R" command)
+	cur          int    // staging buffer the bridge fills next (it alternates)
+	pend         [2]damage
+	rowsCmd      [5]byte
+	outputPrimed bool
+	sharedPixels []uint16
 
 	cmd       *exec.Cmd
 	stdinPipe io.WriteCloser
@@ -49,10 +50,11 @@ var bridgeFrameCmd = []byte{'F'}
 // NewBridgeDisplayController starts driver_bridge and maps its frame buffer.
 func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	panelW, panelH := readPanelSize()
-	renderW, renderH, err := resolveSize(cfg, panelW, panelH)
-	if err != nil {
+	var baseFrame frame
+	if err := baseFrame.configure(cfg, panelW, panelH); err != nil {
 		return nil, err
 	}
+	outputW, outputH := baseFrame.presentation.width, baseFrame.presentation.height
 
 	bridgePath := cfg.BridgePath
 	if cfg.BridgePath != "" {
@@ -66,15 +68,28 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 		bridgePath = "/mnt/sdcard/cubegm/driver_bridge"
 	}
 
-	args := []string{"--size", fmt.Sprintf("%dx%d", renderW, renderH)}
+	args := []string{"--size", fmt.Sprintf("%dx%d", outputW, outputH)}
 	if cfg.VSync {
 		args = append(args, "--vsync")
 	}
 	if cfg.UpdateScreen {
 		args = append(args, "--update-screen")
 	}
+
+	path := cfg.DriverPath
+	if path == "" {
+		var pathErr error
+		path, pathErr = getDriverPath()
+		if pathErr != nil {
+			path = "/usr/lib/driver.so"
+		}
+		if _, err := os.Stat(path); err != nil {
+			path = "/mnt/sdcard/cubegm/driver_sf3000.so"
+		}
+	}
+
 	if cfg.DriverPath != "" {
-		args = append(args, "--driver", cfg.DriverPath)
+		args = append(args, "--driver", path)
 	}
 	cmd := exec.Command(bridgePath, args...)
 
@@ -142,6 +157,10 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 		kill()
 		return nil, fmt.Errorf("invalid dimensions from bridge: %q", line)
 	}
+	if width != outputW || height != outputH {
+		kill()
+		return nil, fmt.Errorf("bridge returned %dx%d, expected %dx%d", width, height, outputW, outputH)
+	}
 	shmPath := parts[3]
 	vsyncOK := parts[4] == "1"
 	rowsOK := len(parts) >= 6 && parts[5] == "R"
@@ -175,41 +194,50 @@ func NewBridgeDisplayController(cfg Config) (*BridgeDisplayController, error) {
 	}
 
 	d := &BridgeDisplayController{
-		downscale:   float64(panelW) / float64(width),
-		vsyncActive: vsyncOK,
-		check:       !cfg.DisableFrameCheck,
-		rowsOK:      rowsOK,
-		pend:        [2]damage{noDamage, noDamage},
-		cmd:         cmd,
-		stdinPipe:   stdin,
-		reader:      reader,
-		shm:         shm,
+		vsyncActive:  vsyncOK,
+		check:        !cfg.DisableFrameCheck,
+		rowsOK:       rowsOK,
+		pend:         [2]damage{{0, height - 1, 0, width - 1}, {0, height - 1, 0, width - 1}},
+		cmd:          cmd,
+		stdinPipe:    stdin,
+		reader:       reader,
+		shm:          shm,
+		sharedPixels: unsafe.Slice((*uint16)(unsafe.Pointer(&shm[0])), totalPixels),
 	}
-	d.w, d.h = width, height
-	d.lw, d.lh = panelW, panelH
-	d.buf = unsafe.Slice((*uint16)(unsafe.Pointer(&shm[0])), totalPixels)
+	d.frame = baseFrame
+	if d.presentation.native(d.w, d.h) {
+		d.buf = d.sharedPixels
+	}
 
 	return d, nil
 }
 
-// Update sends the frame to the bridge and returns once it is copied to the
-// driver. The bridge presents it while you draw the next frame. A frame
-// identical to the last one is skipped.
+// Update sends the composed image to the bridge helper.
+// Unchanged frames are skipped when frame checking is enabled.
 func (d *BridgeDisplayController) Update() error {
 	if d.stdinPipe == nil || len(d.buf) == 0 {
 		return nil
 	}
 
 	t := time.Now()
-	dm := d.fullDamage()
+	dm := d.changed(d.check)
 	if d.check {
-		if dm = d.diff(); dm.empty() {
+		if dm.empty() {
 			d.lastCopy = time.Since(t)
 			d.skipped++
 			return nil
 		}
 	}
 	diffTime := time.Since(t)
+
+	if !d.presentation.native(d.w, d.h) {
+		var err error
+		dm, err = d.presentation.compose(d.sharedPixels, d.buf, d.w, d.h, dm, !d.outputPrimed)
+		if err != nil {
+			return err
+		}
+	}
+	d.outputPrimed = true
 
 	cmd := bridgeFrameCmd
 	if d.rowsOK {
@@ -245,7 +273,6 @@ func (d *BridgeDisplayController) Update() error {
 func (d *BridgeDisplayController) Stats() Stats {
 	return Stats{
 		Backend:     "bridge",
-		Downscale:   d.downscale,
 		VSyncActive: d.vsyncActive,
 		Copy:        d.lastCopy,
 		Wait:        d.lastWait,
@@ -279,6 +306,7 @@ func (d *BridgeDisplayController) Close() {
 	if d.shm != nil {
 		_ = syscall.Munmap(d.shm)
 		d.shm = nil
+		d.sharedPixels = nil
 		d.buf = nil
 	}
 }

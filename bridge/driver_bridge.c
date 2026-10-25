@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
   // Load vendor driver
   const char *driver_path = driver_arg;
   if (!driver_path) {
-    driver_path = "./driver_sf3000.so";
+    driver_path = "/usr/lib/driver.so";
     if (access(driver_path, F_OK) != 0) {
       driver_path = "/mnt/sdcard/cubegm/driver_sf3000.so";
     }

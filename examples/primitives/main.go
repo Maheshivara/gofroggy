@@ -37,7 +37,6 @@ var BorderWidths = []int{1, 2, 3, 4, 6, 8, 10}
 
 var displayConfig = display.Config{
 	Backend:      display.BackendAuto,
-	Downscale:    1,
 	VSync:        false,
 	UpdateScreen: false,
 }
@@ -108,8 +107,8 @@ func (app *Application) Init() error {
 
 	st := disp.Stats()
 	lw, lh := disp.LogicalSize()
-	logMsg(fmt.Sprintf("Display: backend=%s render=%dx%d logical=%dx%d downscale=%.2f",
-		st.Backend, disp.Width(), disp.Height(), lw, lh, st.Downscale))
+	logMsg(fmt.Sprintf("Display: backend=%s render=%dx%d logical=%dx%d",
+		st.Backend, disp.Width(), disp.Height(), lw, lh))
 
 	logMsg("Init: Starting InputController initialization...")
 	inputCtrl, err := input.NewInputController(nil)
