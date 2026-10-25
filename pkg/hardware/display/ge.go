@@ -224,6 +224,9 @@ func NewGEDisplayController(cfg Config) (d *GEDisplayController, err error) {
 		d.frame.buf = unsafe.Slice((*uint16)(unsafe.Pointer(&src[0])), gePanelWidth*gePanelHeight)
 		runtime.KeepAlive(src)
 	}
+	if err = d.configureOSD(cfg); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -513,6 +516,7 @@ func (d *GEDisplayController) closeResources() {
 // Close restores saved pages only after confirmed GE completion.
 // It avoids racing potentially active DMA after a fault.
 func (d *GEDisplayController) Close() {
+	defer d.closeOSD()
 	if d.closed {
 		return
 	}
